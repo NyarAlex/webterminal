@@ -5,26 +5,26 @@ use std::{
     path::PathBuf,
     process::Command,
     sync::{
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
         mpsc,
-        Arc, Mutex,
     },
     thread,
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use axum::{
+    Json, Router,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         Path, Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use chrono::{DateTime, Utc};
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
@@ -88,11 +88,24 @@ struct TerminalSession {
     size: Mutex<PtySize>,
     created_at: DateTime<Utc>,
     input_tx: mpsc::Sender<Vec<u8>>,
+    input_mode: InputMode,
     output_tx: broadcast::Sender<Vec<u8>>,
     replay: Mutex<ReplayBuffer>,
     viewers: AtomicUsize,
     pty: Mutex<Box<dyn MasterPty + Send>>,
     child: Mutex<Option<Box<dyn Child + Send + Sync>>>,
+}
+
+#[derive(Clone)]
+enum InputMode {
+    Direct,
+    TmuxControl(Arc<Mutex<TmuxControlState>>),
+}
+
+#[derive(Default)]
+struct TmuxControlState {
+    initialized: bool,
+    active_pane: Option<String>,
 }
 
 impl TerminalSession {
@@ -153,7 +166,10 @@ impl TerminalSession {
         }
 
         if let Some(cleanup_command) = &self.cleanup_command {
-            let status = Command::new("/bin/sh").arg("-lc").arg(cleanup_command).status();
+            let status = Command::new("/bin/sh")
+                .arg("-lc")
+                .arg(cleanup_command)
+                .status();
             match status {
                 Ok(status) if status.success() => {}
                 Ok(status) => {
@@ -203,6 +219,8 @@ impl ReplayBuffer {
 enum SessionMode {
     Local,
     Ssh,
+    LocalCc,
+    SshCc,
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,6 +228,8 @@ enum SessionMode {
 enum CreateMode {
     Local,
     Ssh,
+    LocalCc,
+    SshCc,
 }
 
 #[derive(Debug, Deserialize)]
@@ -302,7 +322,10 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/sessions", get(list_sessions).post(create_session))
-        .route("/api/sessions/{id}", get(get_session).delete(delete_session))
+        .route(
+            "/api/sessions/{id}",
+            get(get_session).delete(delete_session),
+        )
         .route("/api/sessions/{id}/resize", post(resize_session))
         .route("/ws/sessions/{id}", get(ws_session))
         .fallback_service(ServeDir::new(static_dir).append_index_html_on_directories(true))
@@ -494,11 +517,14 @@ fn spawn_session(
         .with_context(|| format!("failed to spawn command: {}", spec.command))?;
     drop(pair.slave);
 
-    let mut reader = pair
+    let reader = pair
         .master
         .try_clone_reader()
         .context("failed to clone pty reader")?;
-    let mut writer = pair.master.take_writer().context("failed to take pty writer")?;
+    let mut writer = pair
+        .master
+        .take_writer()
+        .context("failed to take pty writer")?;
 
     let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
     let (output_tx, _) = broadcast::channel::<Vec<u8>>(1024);
@@ -517,6 +543,7 @@ fn spawn_session(
         }),
         created_at: Utc::now(),
         input_tx,
+        input_mode: spec.input_mode.clone(),
         output_tx,
         replay: Mutex::new(ReplayBuffer::new()),
         viewers: AtomicUsize::new(0),
@@ -525,24 +552,21 @@ fn spawn_session(
     });
 
     let output_session = Arc::clone(&session);
-    thread::spawn(move || {
-        let mut buf = [0_u8; 8192];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => output_session.append_output(&buf[..n]),
-                Err(err) => {
-                    warn!(session = %output_session.id, error = %err, "pty read failed");
-                    break;
-                }
-            }
-        }
+    let output_mode = spec.input_mode.clone();
+    thread::spawn(move || match output_mode {
+        InputMode::Direct => read_direct_output(output_session, reader),
+        InputMode::TmuxControl(state) => read_tmux_control_output(output_session, reader, state),
     });
 
     let input_session = Arc::clone(&session);
+    let input_mode = session.input_mode.clone();
     thread::spawn(move || {
         while let Ok(data) = input_rx.recv() {
-            if let Err(err) = writer.write_all(&data) {
+            let payload = encode_input_for_mode(&input_mode, &data);
+            if payload.is_empty() {
+                continue;
+            }
+            if let Err(err) = writer.write_all(&payload) {
                 warn!(session = %input_session.id, error = %err, "pty write failed");
                 break;
             }
@@ -557,11 +581,288 @@ fn spawn_session(
     Ok(session)
 }
 
+fn read_direct_output(session: Arc<TerminalSession>, mut reader: Box<dyn Read + Send>) {
+    let mut buf = [0_u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => session.append_output(&buf[..n]),
+            Err(err) => {
+                warn!(session = %session.id, error = %err, "pty read failed");
+                break;
+            }
+        }
+    }
+}
+
+fn read_tmux_control_output(
+    session: Arc<TerminalSession>,
+    mut reader: Box<dyn Read + Send>,
+    state: Arc<Mutex<TmuxControlState>>,
+) {
+    let mut buf = [0_u8; 8192];
+    let mut pending = Vec::<u8>::new();
+
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                pending.extend_from_slice(&buf[..n]);
+                flush_tmux_startup_passthrough(&session, &state, &mut pending);
+                while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
+                    let mut line = pending.drain(..=pos).collect::<Vec<u8>>();
+                    if line.ends_with(b"\n") {
+                        line.pop();
+                    }
+                    if line.ends_with(b"\r") {
+                        line.pop();
+                    }
+                    handle_tmux_control_line(&session, &state, &line);
+                }
+            }
+            Err(err) => {
+                warn!(session = %session.id, error = %err, "tmux control pty read failed");
+                break;
+            }
+        }
+    }
+}
+
+fn flush_tmux_startup_passthrough(
+    session: &Arc<TerminalSession>,
+    state: &Arc<Mutex<TmuxControlState>>,
+    pending: &mut Vec<u8>,
+) {
+    let initialized = state
+        .lock()
+        .expect("tmux control state lock poisoned")
+        .initialized;
+    if initialized || pending.is_empty() || pending[0] == b'%' {
+        return;
+    }
+
+    let flush_len = pending
+        .iter()
+        .position(|b| *b == b'%')
+        .unwrap_or(pending.len());
+    let chunk = pending.drain(..flush_len).collect::<Vec<_>>();
+    if !chunk.is_empty() {
+        session.append_output(&chunk);
+    }
+}
+
+fn handle_tmux_control_line(
+    session: &Arc<TerminalSession>,
+    state: &Arc<Mutex<TmuxControlState>>,
+    line: &[u8],
+) {
+    if line.is_empty() {
+        return;
+    }
+
+    if !line.starts_with(b"%") {
+        let initialized = state
+            .lock()
+            .expect("tmux control state lock poisoned")
+            .initialized;
+        if !initialized {
+            session.append_output(line);
+            session.append_output(b"\r\n");
+        }
+        return;
+    }
+
+    state
+        .lock()
+        .expect("tmux control state lock poisoned")
+        .initialized = true;
+
+    if let Some((pane, payload)) = parse_tmux_output_line(line) {
+        {
+            let mut state = state.lock().expect("tmux control state lock poisoned");
+            if state.active_pane.is_none() {
+                state.active_pane = Some(pane);
+            }
+        }
+        let decoded = decode_tmux_escaped_bytes(payload);
+        if !decoded.is_empty() {
+            session.append_output(&decoded);
+        }
+    }
+}
+
+fn parse_tmux_output_line(line: &[u8]) -> Option<(String, &[u8])> {
+    if let Some(rest) = line.strip_prefix(b"%output ") {
+        let space = rest.iter().position(|b| *b == b' ')?;
+        let pane = String::from_utf8_lossy(&rest[..space]).to_string();
+        return Some((pane, &rest[space + 1..]));
+    }
+
+    if let Some(rest) = line.strip_prefix(b"%extended-output ") {
+        let pane_end = rest.iter().position(|b| *b == b' ')?;
+        let pane = String::from_utf8_lossy(&rest[..pane_end]).to_string();
+        let colon = rest.windows(2).position(|window| window == b": ")?;
+        return Some((pane, &rest[colon + 2..]));
+    }
+
+    None
+}
+
+fn decode_tmux_escaped_bytes(input: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut index = 0;
+
+    while index < input.len() {
+        if input[index] == b'\\' {
+            if index + 3 < input.len()
+                && input[index + 1].is_ascii_digit()
+                && input[index + 2].is_ascii_digit()
+                && input[index + 3].is_ascii_digit()
+                && input[index + 1] < b'8'
+                && input[index + 2] < b'8'
+                && input[index + 3] < b'8'
+            {
+                let value = (input[index + 1] - b'0') * 64
+                    + (input[index + 2] - b'0') * 8
+                    + (input[index + 3] - b'0');
+                output.push(value);
+                index += 4;
+                continue;
+            }
+
+            if index + 1 < input.len() {
+                output.push(input[index + 1]);
+                index += 2;
+                continue;
+            }
+        }
+
+        output.push(input[index]);
+        index += 1;
+    }
+
+    output
+}
+
+fn encode_input_for_mode(mode: &InputMode, data: &[u8]) -> Vec<u8> {
+    match mode {
+        InputMode::Direct => data.to_vec(),
+        InputMode::TmuxControl(state) => {
+            let pane = {
+                let state = state.lock().expect("tmux control state lock poisoned");
+                if !state.initialized {
+                    return data.to_vec();
+                }
+                state.active_pane.clone()
+            };
+
+            if let Some(pane) = pane {
+                encode_tmux_control_input(&pane, data)
+            } else {
+                data.to_vec()
+            }
+        }
+    }
+}
+
+fn encode_tmux_control_input(pane: &str, data: &[u8]) -> Vec<u8> {
+    let mut commands = String::new();
+    let mut literal = String::new();
+    let text = String::from_utf8_lossy(data);
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut index = 0;
+
+    while index < chars.len() {
+        if chars[index] == '\u{1b}' && index + 2 < chars.len() && chars[index + 1] == '[' {
+            flush_tmux_literal(&mut commands, pane, &mut literal);
+
+            if let Some(final_offset) = chars[index + 2..]
+                .iter()
+                .position(|c| matches!(*c, '@'..='~'))
+            {
+                let final_index = index + 2 + final_offset;
+                let params = chars[index + 2..final_index].iter().collect::<String>();
+                match (params.as_str(), chars[final_index]) {
+                    ("", 'A') => commands.push_str(&format!("send-keys -t {pane} Up\n")),
+                    ("", 'B') => commands.push_str(&format!("send-keys -t {pane} Down\n")),
+                    ("", 'C') => commands.push_str(&format!("send-keys -t {pane} Right\n")),
+                    ("", 'D') => commands.push_str(&format!("send-keys -t {pane} Left\n")),
+                    ("", 'H') | ("1", '~') | ("7", '~') => {
+                        commands.push_str(&format!("send-keys -t {pane} Home\n"));
+                    }
+                    ("", 'F') | ("4", '~') | ("8", '~') => {
+                        commands.push_str(&format!("send-keys -t {pane} End\n"));
+                    }
+                    ("3", '~') => commands.push_str(&format!("send-keys -t {pane} Delete\n")),
+                    ("5", '~') => commands.push_str(&format!("send-keys -t {pane} PageUp\n")),
+                    ("6", '~') => commands.push_str(&format!("send-keys -t {pane} PageDown\n")),
+                    ("200", '~') | ("201", '~') => {}
+                    _ => {}
+                }
+                index = final_index + 1;
+                continue;
+            }
+
+            commands.push_str(&format!("send-keys -t {pane} Escape\n"));
+            index += 1;
+            continue;
+        }
+
+        match chars[index] {
+            '\r' | '\n' => {
+                flush_tmux_literal(&mut commands, pane, &mut literal);
+                commands.push_str(&format!("send-keys -t {pane} Enter\n"));
+            }
+            '\t' => {
+                flush_tmux_literal(&mut commands, pane, &mut literal);
+                commands.push_str(&format!("send-keys -t {pane} Tab\n"));
+            }
+            '\u{7f}' | '\u{8}' => {
+                flush_tmux_literal(&mut commands, pane, &mut literal);
+                commands.push_str(&format!("send-keys -t {pane} BS\n"));
+            }
+            '\u{3}' => {
+                flush_tmux_literal(&mut commands, pane, &mut literal);
+                commands.push_str(&format!("send-keys -t {pane} C-c\n"));
+            }
+            '\u{4}' => {
+                flush_tmux_literal(&mut commands, pane, &mut literal);
+                commands.push_str(&format!("send-keys -t {pane} C-d\n"));
+            }
+            '\u{1b}' => {
+                flush_tmux_literal(&mut commands, pane, &mut literal);
+                commands.push_str(&format!("send-keys -t {pane} Escape\n"));
+            }
+            c => literal.push(c),
+        }
+        index += 1;
+    }
+
+    flush_tmux_literal(&mut commands, pane, &mut literal);
+    commands.into_bytes()
+}
+
+fn flush_tmux_literal(commands: &mut String, pane: &str, literal: &mut String) {
+    if literal.is_empty() {
+        return;
+    }
+    commands.push_str(&format!(
+        "send-keys -t {pane} -l -- {}\n",
+        tmux_quote(literal)
+    ));
+    literal.clear();
+}
+
+fn tmux_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "'\\''"))
+}
+
 struct SessionSpec {
     name: String,
     command: String,
     cleanup_command: Option<String>,
     mode: SessionMode,
+    input_mode: InputMode,
 }
 
 fn build_command(id: Uuid, tmux_name: &str, req: CreateSessionRequest) -> Result<SessionSpec> {
@@ -572,12 +873,15 @@ fn build_command(id: Uuid, tmux_name: &str, req: CreateSessionRequest) -> Result
             command,
             cleanup_command: None,
             mode: SessionMode::Local,
+            input_mode: InputMode::Direct,
         });
     }
 
     match req.mode.unwrap_or(CreateMode::Local) {
         CreateMode::Local => {
-            let name = req.name.unwrap_or_else(|| format!("Local {short}", short = short_id(id)));
+            let name = req
+                .name
+                .unwrap_or_else(|| format!("Local {short}", short = short_id(id)));
             let command = format!("tmux new-session -A -s {}", shell_escape(tmux_name));
             let cleanup_command = Some(format!("tmux kill-session -t {}", shell_escape(tmux_name)));
             Ok(SessionSpec {
@@ -585,34 +889,33 @@ fn build_command(id: Uuid, tmux_name: &str, req: CreateSessionRequest) -> Result
                 command,
                 cleanup_command,
                 mode: SessionMode::Local,
+                input_mode: InputMode::Direct,
+            })
+        }
+        CreateMode::LocalCc => {
+            let name = req
+                .name
+                .unwrap_or_else(|| format!("Local CC {short}", short = short_id(id)));
+            let command = format!("tmux -CC new-session -A -s {}", shell_escape(tmux_name));
+            let cleanup_command = Some(format!("tmux kill-session -t {}", shell_escape(tmux_name)));
+            Ok(SessionSpec {
+                name,
+                command,
+                cleanup_command,
+                mode: SessionMode::LocalCc,
+                input_mode: InputMode::TmuxControl(Arc::new(Mutex::new(
+                    TmuxControlState::default(),
+                ))),
             })
         }
         CreateMode::Ssh => {
             let ssh = req.ssh.ok_or_else(|| anyhow!("ssh target is required"))?;
             let port = ssh.port.unwrap_or(22);
-            let mut parts = vec![
-                "ssh".to_string(),
-                "-tt".to_string(),
-                "-p".to_string(),
-                shell_escape(&port.to_string()),
-                "-o".to_string(),
-                shell_escape("ServerAliveInterval=30"),
-                "-o".to_string(),
-                shell_escape("ServerAliveCountMax=3"),
-                "-o".to_string(),
-                shell_escape("StrictHostKeyChecking=accept-new"),
-            ];
-
-            if let Some(key_path) = ssh.key_path {
-                parts.push("-i".to_string());
-                parts.push(shell_escape(&key_path));
-            }
-
-            parts.push(shell_escape(&format!("{}@{}", ssh.username, ssh.host)));
-            parts.push(shell_escape(&format!(
-                "tmux new-session -A -s {}",
-                shell_escape(tmux_name)
-            )));
+            let parts = ssh_command_parts(
+                &ssh,
+                port,
+                &format!("tmux new-session -A -s {}", shell_escape(tmux_name)),
+            );
 
             let name = req
                 .name
@@ -622,9 +925,56 @@ fn build_command(id: Uuid, tmux_name: &str, req: CreateSessionRequest) -> Result
                 command: parts.join(" "),
                 cleanup_command: None,
                 mode: SessionMode::Ssh,
+                input_mode: InputMode::Direct,
+            })
+        }
+        CreateMode::SshCc => {
+            let ssh = req.ssh.ok_or_else(|| anyhow!("ssh target is required"))?;
+            let port = ssh.port.unwrap_or(22);
+            let parts = ssh_command_parts(
+                &ssh,
+                port,
+                &format!("tmux -CC new-session -A -s {}", shell_escape(tmux_name)),
+            );
+
+            let name = req
+                .name
+                .unwrap_or_else(|| format!("{}@{} CC", ssh.username, ssh.host));
+            Ok(SessionSpec {
+                name,
+                command: parts.join(" "),
+                cleanup_command: None,
+                mode: SessionMode::SshCc,
+                input_mode: InputMode::TmuxControl(Arc::new(Mutex::new(
+                    TmuxControlState::default(),
+                ))),
             })
         }
     }
+}
+
+fn ssh_command_parts(ssh: &SshTarget, port: u16, remote_command: &str) -> Vec<String> {
+    let mut parts = vec![
+        "ssh".to_string(),
+        "-tt".to_string(),
+        "-p".to_string(),
+        shell_escape(&port.to_string()),
+        "-o".to_string(),
+        shell_escape("ServerAliveInterval=30"),
+        "-o".to_string(),
+        shell_escape("ServerAliveCountMax=3"),
+        "-o".to_string(),
+        shell_escape("StrictHostKeyChecking=accept-new"),
+    ];
+
+    if let Some(key_path) = &ssh.key_path {
+        parts.push("-i".to_string());
+        parts.push(shell_escape(key_path));
+    }
+
+    parts.push(shell_escape(&format!("{}@{}", ssh.username, ssh.host)));
+    parts.push(shell_escape(remote_command));
+    parts
 }
 
 fn sanitize_tmux_name(input: Option<&str>, id: &Uuid) -> String {

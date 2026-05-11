@@ -22,7 +22,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
 import "./styles.css";
 
-type SessionMode = "local" | "ssh";
+type SessionMode = "local" | "ssh" | "local_cc" | "ssh_cc";
 type InteractionMode = "input" | "browse";
 
 interface SessionSummary {
@@ -185,7 +185,7 @@ function App() {
                 }}
               >
                 <span className="sessionIcon">
-                  {session.mode === "ssh" ? <Wifi size={16} /> : <Monitor size={16} />}
+                  {session.mode.includes("ssh") ? <Wifi size={16} /> : <Monitor size={16} />}
                 </span>
                 <span className="sessionText">
                   <strong>{session.name}</strong>
@@ -351,6 +351,7 @@ function TerminalPane({
   const lastModeRef = React.useRef<InteractionMode>("input");
   const [connected, setConnected] = useState(false);
   const [interactionMode, setInteractionMode] = useState<InteractionMode>("input");
+  const controlMode = session.mode === "local_cc" || session.mode === "ssh_cc";
 
   useEffect(() => {
     const term = new Terminal({
@@ -434,22 +435,22 @@ function TerminalPane({
 
     term.options.disableStdin = interactionMode === "browse";
     if (interactionMode === "input") {
-      if (lastModeRef.current === "browse" && ws?.readyState === WebSocket.OPEN) {
+      if (!controlMode && lastModeRef.current === "browse" && ws?.readyState === WebSocket.OPEN) {
         ws.send("\x1b");
       }
       term.scrollToBottom();
       term.focus();
     } else {
-      if (lastModeRef.current === "input" && ws?.readyState === WebSocket.OPEN) {
+      if (!controlMode && lastModeRef.current === "input" && ws?.readyState === WebSocket.OPEN) {
         ws.send("\x02[");
       }
       term.blur();
     }
     lastModeRef.current = interactionMode;
-  }, [interactionMode]);
+  }, [controlMode, interactionMode]);
 
   useEffect(() => {
-    if (interactionMode !== "browse") return;
+    if (controlMode || interactionMode !== "browse") return;
 
     const container = containerRef.current;
     const viewport = container?.querySelector<HTMLElement>(".xterm-viewport");
@@ -511,7 +512,7 @@ function TerminalPane({
       container.removeEventListener("touchend", onTouchEnd, { capture: true });
       container.removeEventListener("touchcancel", onTouchEnd, { capture: true });
     };
-  }, [interactionMode]);
+  }, [controlMode, interactionMode]);
 
   useEffect(() => {
     if (resizeToken === 0) return;
@@ -704,6 +705,7 @@ function CreateSessionDialog({
   const [keyPath, setKeyPath] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const sshMode = mode === "ssh" || mode === "ssh_cc";
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -717,7 +719,7 @@ function CreateSessionDialog({
       rows: 36,
     };
 
-    if (mode === "ssh") {
+    if (sshMode) {
       payload.ssh = {
         host: host.trim(),
         username: username.trim(),
@@ -765,6 +767,22 @@ function CreateSessionDialog({
             >
               SSH tmux
             </button>
+            <button
+              type="button"
+              className={mode === "local_cc" ? "selected" : ""}
+              disabled={submitting}
+              onClick={() => setMode("local_cc")}
+            >
+              Local -CC
+            </button>
+            <button
+              type="button"
+              className={mode === "ssh_cc" ? "selected" : ""}
+              disabled={submitting}
+              onClick={() => setMode("ssh_cc")}
+            >
+              SSH -CC
+            </button>
           </div>
         </label>
 
@@ -778,7 +796,7 @@ function CreateSessionDialog({
           <input disabled={submitting} value={tmuxName} onChange={(event) => setTmuxName(event.target.value)} placeholder="webterminal-main" />
         </label>
 
-        {mode === "ssh" && (
+        {sshMode && (
           <div className="formGrid">
             <label>
               Host
