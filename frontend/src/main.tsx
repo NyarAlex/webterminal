@@ -1,7 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
+  ChevronDown,
   ChevronRight,
+  ChevronUp,
   Circle,
   Command,
   Copy,
@@ -9,6 +11,7 @@ import {
   Maximize2,
   Menu,
   Monitor,
+  Pencil,
   Plus,
   RefreshCw,
   Server,
@@ -78,6 +81,11 @@ interface TmuxPane {
   current_path: string;
 }
 
+interface TmuxAnnotations {
+  windows: Record<string, string>;
+  panes: Record<string, string>;
+}
+
 type ServerMessage =
   | { type: "clear" }
   | { type: "focus_pane"; pane_id: string }
@@ -135,11 +143,31 @@ function sessionModeLabel(mode: SessionMode): string {
   }
 }
 
+function annotationStorageKey(scope: string): string {
+  return `webterminal.annotations.${scope}`;
+}
+
+function loadAnnotations(scope: string): TmuxAnnotations {
+  try {
+    const raw = window.localStorage.getItem(annotationStorageKey(scope));
+    if (!raw) return { windows: {}, panes: {} };
+    const parsed = JSON.parse(raw) as Partial<TmuxAnnotations>;
+    return { windows: parsed.windows ?? {}, panes: parsed.panes ?? {} };
+  } catch {
+    return { windows: {}, panes: {} };
+  }
+}
+
+function saveAnnotations(scope: string, annotations: TmuxAnnotations) {
+  window.localStorage.setItem(annotationStorageKey(scope), JSON.stringify(annotations));
+}
+
 function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [formOpen, setFormOpen] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [sessionActionsOpen, setSessionActionsOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<SessionSummary | null>(null);
   const [resizeToken, setResizeToken] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -158,6 +186,10 @@ function App() {
   useEffect(() => {
     void refresh().catch((err: unknown) => setError(String(err)));
   }, []);
+
+  useEffect(() => {
+    setSessionActionsOpen(false);
+  }, [activeId]);
 
   const createSession = async (payload: CreateSessionPayload) => {
     setError(null);
@@ -255,21 +287,32 @@ function App() {
           <div className="topbarActions">
             {active && (
               <>
-                <span className="statusPill">{sessionModeLabel(active.mode)}</span>
-                <span className="statusPill">{active.cols}x{active.rows}</span>
+                {sessionActionsOpen && (
+                  <>
+                    <span className="statusPill">{sessionModeLabel(active.mode)}</span>
+                    <span className="statusPill">{active.cols}x{active.rows}</span>
+                    <button
+                      className="iconButton"
+                      title="Reset PTY size to this view"
+                      onClick={() => setResizeToken((current) => current + 1)}
+                    >
+                      <Maximize2 size={16} />
+                    </button>
+                    <button
+                      className="iconButton danger"
+                      title="Terminate session"
+                      onClick={() => setDeleteTarget(active)}
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </>
+                )}
                 <button
                   className="iconButton"
-                  title="Reset PTY size to this view"
-                  onClick={() => setResizeToken((current) => current + 1)}
+                  title={sessionActionsOpen ? "Hide session actions" : "Show session actions"}
+                  onClick={() => setSessionActionsOpen((open) => !open)}
                 >
-                  <Maximize2 size={16} />
-                </button>
-                <button
-                  className="iconButton danger"
-                  title="Terminate session"
-                  onClick={() => setDeleteTarget(active)}
-                >
-                  <Trash2 size={16} />
+                  {sessionActionsOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
                 </button>
               </>
             )}
@@ -396,7 +439,20 @@ function TerminalPane({
   const [interactionMode, setInteractionMode] = useState<InteractionMode>("input");
   const [tmuxState, setTmuxState] = useState<TmuxState | null>(null);
   const [focusedPane, setFocusedPane] = useState<string | null>(null);
+  const [toolsOpen, setToolsOpen] = useState(false);
+  const [annotations, setAnnotations] = useState<TmuxAnnotations>(() => loadAnnotations(session.command));
   const controlMode = session.mode === "local_cc" || session.mode === "ssh_cc";
+  const activePane = findActivePane(tmuxState, focusedPane);
+  const activeWindow = findWindowForPane(tmuxState, activePane?.id ?? null);
+  const activeContext =
+    activeWindow && activePane
+      ? `${windowLabel(activeWindow, annotations)} / ${paneLabel(activePane, annotations)}`
+      : session.name;
+
+  useEffect(() => {
+    setAnnotations(loadAnnotations(session.command));
+    setToolsOpen(false);
+  }, [session.id, session.command]);
 
   useEffect(() => {
     const term = new Terminal({
@@ -601,6 +657,26 @@ function TerminalPane({
     ws.send(JSON.stringify({ type: "tmux_command", command }));
   };
 
+  const annotateTarget = (target: "window" | "pane", id: string, current: string) => {
+    const next = window.prompt("Note", current);
+    if (next === null) return;
+    setAnnotations((currentAnnotations) => {
+      const trimmed = next.trim();
+      const updated: TmuxAnnotations = {
+        windows: { ...currentAnnotations.windows },
+        panes: { ...currentAnnotations.panes },
+      };
+      const bucket = target === "window" ? updated.windows : updated.panes;
+      if (trimmed) {
+        bucket[id] = trimmed;
+      } else {
+        delete bucket[id];
+      }
+      saveAnnotations(session.command, updated);
+      return updated;
+    });
+  };
+
   const copySelection = async () => {
     const selection = termRef.current?.getSelection() ?? "";
     if (!selection) return;
@@ -609,24 +685,38 @@ function TerminalPane({
 
   return (
     <div className="terminalWrap">
-      <div className="terminalChrome">
-        <span className={connected ? "connected" : "disconnected"}>
-          {connected ? "connected" : "disconnected"}
+      <div className="terminalChrome compact">
+        <span className={`connectionBadge ${connected ? "connected" : "disconnected"}`}>
+          {connected ? "on" : "off"}
         </span>
-        <span className="terminalCommand">{session.command}</span>
+        <span className="terminalContext">{activeContext}</span>
         <ModeSwitch mode={interactionMode} onChange={setInteractionMode} />
-        <button className="chromeButton" type="button" onClick={() => void copySelection()}>
-          <Copy size={14} />
-          Copy
+        <button
+          className="iconButton compactIcon"
+          type="button"
+          title={toolsOpen ? "Hide tmux controls" : "Show tmux controls"}
+          onClick={() => setToolsOpen((open) => !open)}
+        >
+          {toolsOpen ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
         </button>
-        <Maximize2 size={15} />
       </div>
-      {controlMode && tmuxState && (
+      {toolsOpen && (
+        <div className="terminalTools">
+          <button className="chromeButton" type="button" onClick={() => void copySelection()}>
+            <Copy size={14} />
+            Copy
+          </button>
+          <span className="terminalCommand">{session.command}</span>
+        </div>
+      )}
+      {controlMode && tmuxState && toolsOpen && (
         <TmuxNavigator
           state={tmuxState}
           focusedPane={focusedPane}
+          annotations={annotations}
           onFocusPane={focusPane}
           onCommand={sendTmuxCommand}
+          onAnnotate={annotateTarget}
         />
       )}
       <div
@@ -685,16 +775,43 @@ function handleServerTextMessage(
   }
 }
 
+function findActivePane(state: TmuxState | null, focusedPane: string | null): TmuxPane | null {
+  const panes = state?.windows.flatMap((window) => window.panes) ?? [];
+  return (
+    panes.find((pane) => pane.id === focusedPane) ??
+    panes.find((pane) => pane.id === state?.active_pane) ??
+    panes[0] ??
+    null
+  );
+}
+
+function findWindowForPane(state: TmuxState | null, paneId: string | null): TmuxWindow | null {
+  if (!state || !paneId) return null;
+  return state.windows.find((window) => window.panes.some((pane) => pane.id === paneId)) ?? null;
+}
+
+function windowLabel(window: TmuxWindow, annotations: TmuxAnnotations): string {
+  return annotations.windows[window.id] || `${window.index ?? "-"} ${window.name || window.id}`;
+}
+
+function paneLabel(pane: TmuxPane, annotations: TmuxAnnotations): string {
+  return annotations.panes[pane.id] || `${pane.id} ${pane.current_command || "shell"}`;
+}
+
 function TmuxNavigator({
   state,
   focusedPane,
+  annotations,
   onFocusPane,
   onCommand,
+  onAnnotate,
 }: {
   state: TmuxState;
   focusedPane: string | null;
+  annotations: TmuxAnnotations;
   onFocusPane: (paneId: string) => void;
   onCommand: (command: TmuxCommand) => void;
+  onAnnotate: (target: "window" | "pane", id: string, current: string) => void;
 }) {
   const activePane =
     state.windows.flatMap((window) => window.panes).find((pane) => pane.id === focusedPane) ??
@@ -705,27 +822,43 @@ function TmuxNavigator({
     <div className="tmuxNavigator">
       <div className="tmuxWindows">
         {state.windows.map((window) => (
-          <button
-            type="button"
+          <span
             key={window.id}
-            className={window.panes.some((pane) => pane.id === activePane?.id) ? "selected" : ""}
-            onClick={() => window.panes[0] && onFocusPane(window.panes[0].id)}
+            className={`tmuxChip ${window.panes.some((pane) => pane.id === activePane?.id) ? "selected" : ""}`}
           >
-            {window.index ?? "-"} {window.name || window.id}
-          </button>
+            <button type="button" onClick={() => window.panes[0] && onFocusPane(window.panes[0].id)}>
+              {windowLabel(window, annotations)}
+            </button>
+            <button
+              type="button"
+              className="noteButton"
+              title="Edit tab note"
+              onClick={() => onAnnotate("window", window.id, annotations.windows[window.id] ?? "")}
+            >
+              <Pencil size={12} />
+            </button>
+          </span>
         ))}
       </div>
       <div className="tmuxPanes">
         {state.windows.flatMap((window) =>
           window.panes.map((pane) => (
-            <button
-              type="button"
+            <span
               key={pane.id}
-              className={pane.id === activePane?.id ? "selected" : ""}
-              onClick={() => onFocusPane(pane.id)}
+              className={`tmuxChip ${pane.id === activePane?.id ? "selected" : ""}`}
             >
-              {pane.id} {pane.current_command || "shell"}
-            </button>
+              <button type="button" onClick={() => onFocusPane(pane.id)}>
+                {paneLabel(pane, annotations)}
+              </button>
+              <button
+                type="button"
+                className="noteButton"
+                title="Edit pane note"
+                onClick={() => onAnnotate("pane", pane.id, annotations.panes[pane.id] ?? "")}
+              >
+                <Pencil size={12} />
+              </button>
+            </span>
           )),
         )}
       </div>

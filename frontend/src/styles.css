@@ -279,7 +279,7 @@ input:disabled {
 
 .terminalWrap {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
   flex: 1;
   min-height: 0;
   background: #101315;
@@ -287,11 +287,48 @@ input:disabled {
 
 .terminalChrome {
   gap: 10px;
+  min-height: 34px;
   min-width: 0;
   padding: 0 12px;
   border-bottom: 1px solid #263038;
   color: #9aa8b0;
   font-size: 12px;
+}
+
+.terminalChrome.compact {
+  justify-content: flex-start;
+}
+
+.terminalContext {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: #dce5e9;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connectionBadge {
+  flex: 0 0 auto;
+  min-width: 28px;
+  font-weight: 800;
+}
+
+.compactIcon {
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+}
+
+.terminalTools {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+  padding: 5px 8px;
+  border-bottom: 1px solid #263038;
+  background: #11171a;
 }
 
 .modeSwitch {
@@ -375,29 +412,45 @@ input:disabled {
   justify-content: flex-end;
 }
 
-.tmuxNavigator button {
+.tmuxChip {
+  display: inline-flex;
   flex: 0 0 auto;
-  max-width: 160px;
-  min-height: 28px;
-  padding: 0 9px;
+  max-width: 190px;
   overflow: hidden;
   border: 1px solid #34414a;
   border-radius: 7px;
   background: #20262b;
+}
+
+.tmuxChip.selected {
+  border-color: #d5a93d;
+  background: #2f3329;
+}
+
+.tmuxNavigator button {
+  flex: 0 0 auto;
+  min-height: 28px;
+  padding: 0 9px;
+  overflow: hidden;
+  border: 0;
+  background: transparent;
   color: #b8c5ca;
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.tmuxNavigator button.selected {
-  border-color: #d5a93d;
-  background: #2f3329;
+.tmuxChip.selected button {
   color: #f3c969;
 }
 
-.tmuxNavigator button.dangerMini {
-  color: #ffaaa4;
+.tmuxNavigator .noteButton {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  padding: 0;
+  border-left: 1px solid #34414a;
+  color: #82919a;
 }
 
 .terminalSurface {
@@ -677,7 +730,7 @@ input:disabled {
   }
 
   .terminalWrap {
-    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    grid-template-rows: auto auto auto minmax(0, 1fr) auto;
   }
 
   .tmuxNavigator {
