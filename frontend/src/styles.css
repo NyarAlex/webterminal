@@ -279,7 +279,7 @@ input:disabled {
 
 .terminalWrap {
   display: grid;
-  grid-template-rows: 34px minmax(0, 1fr) auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   flex: 1;
   min-height: 0;
   background: #101315;
@@ -348,6 +348,56 @@ input:disabled {
 
 .disconnected {
   color: #ff9e96;
+}
+
+.tmuxNavigator {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr) auto;
+  gap: 6px;
+  align-items: center;
+  min-height: 38px;
+  padding: 5px 8px;
+  border-bottom: 1px solid #263038;
+  background: #12171a;
+}
+
+.tmuxWindows,
+.tmuxPanes,
+.tmuxActions {
+  display: flex;
+  gap: 5px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.tmuxActions {
+  justify-content: flex-end;
+}
+
+.tmuxNavigator button {
+  flex: 0 0 auto;
+  max-width: 160px;
+  min-height: 28px;
+  padding: 0 9px;
+  overflow: hidden;
+  border: 1px solid #34414a;
+  border-radius: 7px;
+  background: #20262b;
+  color: #b8c5ca;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tmuxNavigator button.selected {
+  border-color: #d5a93d;
+  background: #2f3329;
+  color: #f3c969;
+}
+
+.tmuxNavigator button.dangerMini {
+  color: #ffaaa4;
 }
 
 .terminalSurface {
@@ -627,7 +677,17 @@ input:disabled {
   }
 
   .terminalWrap {
-    grid-template-rows: 36px minmax(0, 1fr) auto;
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+  }
+
+  .tmuxNavigator {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+    padding: 5px;
+  }
+
+  .tmuxActions {
+    justify-content: flex-start;
   }
 
   .terminalSurface {

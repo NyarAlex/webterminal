@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     io::{Read, Write},
     net::SocketAddr,
     path::PathBuf,
@@ -89,7 +89,7 @@ struct TerminalSession {
     created_at: DateTime<Utc>,
     input_tx: mpsc::Sender<PtyInput>,
     input_mode: InputMode,
-    output_tx: broadcast::Sender<Vec<u8>>,
+    output_tx: broadcast::Sender<SessionEvent>,
     replay: Mutex<ReplayBuffer>,
     viewers: AtomicUsize,
     pty: Mutex<Box<dyn MasterPty + Send>>,
@@ -103,7 +103,10 @@ enum InputMode {
 }
 
 enum PtyInput {
-    User(Vec<u8>),
+    User {
+        data: Vec<u8>,
+        pane_id: Option<String>,
+    },
     Raw(Vec<u8>),
 }
 
@@ -111,6 +114,108 @@ enum PtyInput {
 struct TmuxControlState {
     initialized: bool,
     active_pane: Option<String>,
+    refresh_generation: u64,
+    pending_generation: Option<u64>,
+    pending_windows: BTreeMap<String, TmuxWindow>,
+    pending_panes: BTreeMap<String, TmuxPane>,
+    windows: Vec<TmuxWindow>,
+    pane_replay: HashMap<String, ReplayBuffer>,
+}
+
+#[derive(Clone)]
+enum SessionEvent {
+    Output(Vec<u8>),
+    PaneOutput { pane_id: String, data: Vec<u8> },
+    TmuxState(TmuxStateSnapshot),
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TmuxStateSnapshot {
+    active_pane: Option<String>,
+    windows: Vec<TmuxWindow>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TmuxWindow {
+    id: String,
+    index: Option<u16>,
+    name: String,
+    active: bool,
+    panes: Vec<TmuxPane>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TmuxPane {
+    id: String,
+    window_id: String,
+    index: Option<u16>,
+    active: bool,
+    current_command: String,
+    current_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ClientMessage {
+    FocusPane { pane_id: String },
+    TmuxCommand { command: TmuxUiCommand },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TmuxUiCommand {
+    NewWindow,
+    SplitHorizontal,
+    SplitVertical,
+    KillPane,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ServerMessage<'a> {
+    Clear,
+    FocusPane { pane_id: &'a str },
+    TmuxState { state: TmuxStateSnapshot },
+}
+
+impl TmuxControlState {
+    fn snapshot(&self) -> TmuxStateSnapshot {
+        TmuxStateSnapshot {
+            active_pane: self.active_pane.clone(),
+            windows: self.windows.clone(),
+        }
+    }
+
+    fn upsert_pane_placeholder(&mut self, pane_id: &str) {
+        if self
+            .windows
+            .iter()
+            .any(|window| window.panes.iter().any(|pane| pane.id == pane_id))
+        {
+            return;
+        }
+
+        let mut window = self.windows.first().cloned().unwrap_or_else(|| TmuxWindow {
+            id: "@0".to_string(),
+            index: Some(0),
+            name: "tmux".to_string(),
+            active: true,
+            panes: Vec::new(),
+        });
+        window.panes.push(TmuxPane {
+            id: pane_id.to_string(),
+            window_id: window.id.clone(),
+            index: Some(window.panes.len() as u16),
+            active: true,
+            current_command: String::new(),
+            current_path: String::new(),
+        });
+        if self.windows.is_empty() {
+            self.windows.push(window);
+        } else {
+            self.windows[0] = window;
+        }
+    }
 }
 
 impl TerminalSession {
@@ -128,9 +233,9 @@ impl TerminalSession {
         }
     }
 
-    fn write_input(&self, data: Vec<u8>) -> Result<()> {
+    fn write_input(&self, data: Vec<u8>, pane_id: Option<String>) -> Result<()> {
         self.input_tx
-            .send(PtyInput::User(data))
+            .send(PtyInput::User { data, pane_id })
             .map_err(|_| anyhow!("terminal input channel is closed"))
     }
 
@@ -140,16 +245,70 @@ impl TerminalSession {
             .map_err(|_| anyhow!("terminal input channel is closed"))
     }
 
-    fn append_output(&self, chunk: &[u8]) {
+    fn append_direct_output(&self, chunk: &[u8]) {
         self.replay
             .lock()
             .expect("replay lock poisoned")
             .push(chunk.to_vec());
-        let _ = self.output_tx.send(chunk.to_vec());
+        let _ = self.output_tx.send(SessionEvent::Output(chunk.to_vec()));
+    }
+
+    fn append_pane_output(&self, pane_id: &str, chunk: &[u8]) {
+        if let InputMode::TmuxControl(state) = &self.input_mode {
+            state
+                .lock()
+                .expect("tmux control state lock poisoned")
+                .pane_replay
+                .entry(pane_id.to_string())
+                .or_insert_with(ReplayBuffer::new)
+                .push(chunk.to_vec());
+        }
+        let _ = self.output_tx.send(SessionEvent::PaneOutput {
+            pane_id: pane_id.to_string(),
+            data: chunk.to_vec(),
+        });
     }
 
     fn replay_chunks(&self) -> Vec<Vec<u8>> {
         self.replay.lock().expect("replay lock poisoned").chunks()
+    }
+
+    fn replay_pane_chunks(&self, pane_id: &str) -> Vec<Vec<u8>> {
+        match &self.input_mode {
+            InputMode::TmuxControl(state) => state
+                .lock()
+                .expect("tmux control state lock poisoned")
+                .pane_replay
+                .get(pane_id)
+                .map(ReplayBuffer::chunks)
+                .unwrap_or_default(),
+            InputMode::Direct => self.replay_chunks(),
+        }
+    }
+
+    fn tmux_state_snapshot(&self) -> Option<TmuxStateSnapshot> {
+        match &self.input_mode {
+            InputMode::TmuxControl(state) => Some(
+                state
+                    .lock()
+                    .expect("tmux control state lock poisoned")
+                    .snapshot(),
+            ),
+            InputMode::Direct => None,
+        }
+    }
+
+    fn default_pane_id(&self) -> Option<String> {
+        self.tmux_state_snapshot().and_then(|state| {
+            state.active_pane.or_else(|| {
+                state
+                    .windows
+                    .iter()
+                    .flat_map(|w| w.panes.iter())
+                    .next()
+                    .map(|p| p.id.clone())
+            })
+        })
     }
 
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {
@@ -168,8 +327,51 @@ impl TerminalSession {
         *self.size.lock().expect("size lock poisoned") = size;
         if matches!(self.input_mode, InputMode::TmuxControl(_)) {
             self.write_raw_input(format!("refresh-client -C {cols},{rows}\n").into_bytes())?;
+            self.request_tmux_state_refresh()?;
         }
         Ok(())
+    }
+
+    fn request_tmux_state_refresh(&self) -> Result<()> {
+        let generation = match &self.input_mode {
+            InputMode::TmuxControl(state) => {
+                let mut state = state.lock().expect("tmux control state lock poisoned");
+                state.refresh_generation = state.refresh_generation.saturating_add(1);
+                let generation = state.refresh_generation;
+                state.pending_generation = Some(generation);
+                state.pending_windows.clear();
+                state.pending_panes.clear();
+                generation
+            }
+            InputMode::Direct => return Ok(()),
+        };
+
+        self.write_raw_input(
+            format!(
+                "list-windows -F 'WT_WINDOW\t{generation}\t#{{window_id}}\t#{{window_index}}\t#{{window_name}}\t#{{window_active}}'\n\
+                 list-panes -s -F 'WT_PANE\t{generation}\t#{{window_id}}\t#{{pane_id}}\t#{{pane_index}}\t#{{pane_active}}\t#{{pane_current_command}}\t#{{pane_current_path}}'\n\
+                 display-message -p 'WT_DONE\t{generation}'\n"
+            )
+            .into_bytes(),
+        )
+    }
+
+    fn send_tmux_ui_command(&self, command: TmuxUiCommand, pane_id: Option<&str>) -> Result<()> {
+        let target = pane_id.map(tmux_quote);
+        let command = match command {
+            TmuxUiCommand::NewWindow => "new-window\n".to_string(),
+            TmuxUiCommand::SplitHorizontal => {
+                format!("split-window -h{}\n", tmux_target_arg(target.as_deref()))
+            }
+            TmuxUiCommand::SplitVertical => {
+                format!("split-window -v{}\n", tmux_target_arg(target.as_deref()))
+            }
+            TmuxUiCommand::KillPane => {
+                format!("kill-pane{}\n", tmux_target_arg(target.as_deref()))
+            }
+        };
+        self.write_raw_input(command.into_bytes())?;
+        self.request_tmux_state_refresh()
     }
 
     fn close(&self) {
@@ -442,11 +644,33 @@ async fn ws_session(
 async fn handle_socket(mut socket: WebSocket, session: Arc<TerminalSession>, readonly: bool) {
     session.viewers.fetch_add(1, Ordering::Relaxed);
     let mut rx = session.output_tx.subscribe();
+    let mut focused_pane = session.default_pane_id();
 
-    for chunk in session.replay_chunks() {
-        if socket.send(Message::Binary(chunk.into())).await.is_err() {
+    if let Some(state) = session.tmux_state_snapshot() {
+        if send_server_message(&mut socket, &ServerMessage::TmuxState { state })
+            .await
+            .is_err()
+        {
             session.viewers.fetch_sub(1, Ordering::Relaxed);
             return;
+        }
+        if let Some(pane_id) = focused_pane.as_deref() {
+            if send_focus_and_replay(&mut socket, &session, pane_id)
+                .await
+                .is_err()
+            {
+                session.viewers.fetch_sub(1, Ordering::Relaxed);
+                return;
+            }
+        } else if let Err(err) = session.request_tmux_state_refresh() {
+            warn!(session = %session.id, error = %err, "failed to request tmux state");
+        }
+    } else {
+        for chunk in session.replay_chunks() {
+            if socket.send(Message::Binary(chunk.into())).await.is_err() {
+                session.viewers.fetch_sub(1, Ordering::Relaxed);
+                return;
+            }
         }
     }
 
@@ -455,16 +679,33 @@ async fn handle_socket(mut socket: WebSocket, session: Arc<TerminalSession>, rea
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        if !readonly {
-                            if let Err(err) = session.write_input(text.as_bytes().to_vec()) {
-                                warn!(session = %session.id, error = %err, "failed to write text input");
-                                break;
+                        if readonly {
+                            continue;
+                        }
+                        match serde_json::from_str::<ClientMessage>(&text) {
+                            Ok(ClientMessage::FocusPane { pane_id }) => {
+                                focused_pane = Some(pane_id.clone());
+                                if send_focus_and_replay(&mut socket, &session, &pane_id).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(ClientMessage::TmuxCommand { command }) => {
+                                if let Err(err) = session.send_tmux_ui_command(command, focused_pane.as_deref()) {
+                                    warn!(session = %session.id, error = %err, "failed to send tmux UI command");
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                if let Err(err) = session.write_input(text.as_bytes().to_vec(), focused_pane.clone()) {
+                                    warn!(session = %session.id, error = %err, "failed to write text input");
+                                    break;
+                                }
                             }
                         }
                     }
                     Some(Ok(Message::Binary(data))) => {
                         if !readonly {
-                            if let Err(err) = session.write_input(data.to_vec()) {
+                            if let Err(err) = session.write_input(data.to_vec(), focused_pane.clone()) {
                                 warn!(session = %session.id, error = %err, "failed to write binary input");
                                 break;
                             }
@@ -485,8 +726,26 @@ async fn handle_socket(mut socket: WebSocket, session: Arc<TerminalSession>, rea
             }
             output = rx.recv() => {
                 match output {
-                    Ok(chunk) => {
-                        if socket.send(Message::Binary(chunk.into())).await.is_err() {
+                    Ok(SessionEvent::Output(chunk)) => {
+                        if socket.send(Message::Binary(chunk.into())).await.is_err() { break; }
+                    }
+                    Ok(SessionEvent::PaneOutput { pane_id, data }) => {
+                        if focused_pane.as_deref() == Some(pane_id.as_str())
+                            && socket.send(Message::Binary(data.into())).await.is_err() {
+                                break;
+                            }
+                    }
+                    Ok(SessionEvent::TmuxState(state)) => {
+                        if focused_pane.is_none() {
+                            focused_pane = state.active_pane.clone().or_else(|| {
+                                state.windows.iter().flat_map(|window| window.panes.iter()).next().map(|pane| pane.id.clone())
+                            });
+                            if let Some(pane_id) = focused_pane.as_deref()
+                                && send_focus_and_replay(&mut socket, &session, pane_id).await.is_err() {
+                                    break;
+                                }
+                        }
+                        if send_server_message(&mut socket, &ServerMessage::TmuxState { state }).await.is_err() {
                             break;
                         }
                     }
@@ -500,6 +759,29 @@ async fn handle_socket(mut socket: WebSocket, session: Arc<TerminalSession>, rea
     }
 
     session.viewers.fetch_sub(1, Ordering::Relaxed);
+}
+
+async fn send_focus_and_replay(
+    socket: &mut WebSocket,
+    session: &TerminalSession,
+    pane_id: &str,
+) -> Result<()> {
+    send_server_message(socket, &ServerMessage::FocusPane { pane_id }).await?;
+    send_server_message(socket, &ServerMessage::Clear).await?;
+    for chunk in session.replay_pane_chunks(pane_id) {
+        socket
+            .send(Message::Binary(chunk.into()))
+            .await
+            .context("failed to send pane replay")?;
+    }
+    Ok(())
+}
+
+async fn send_server_message(socket: &mut WebSocket, message: &ServerMessage<'_>) -> Result<()> {
+    socket
+        .send(Message::Text(serde_json::to_string(message)?.into()))
+        .await
+        .context("failed to send websocket message")
 }
 
 fn spawn_session(
@@ -541,7 +823,7 @@ fn spawn_session(
         .context("failed to take pty writer")?;
 
     let (input_tx, input_rx) = mpsc::channel::<PtyInput>();
-    let (output_tx, _) = broadcast::channel::<Vec<u8>>(1024);
+    let (output_tx, _) = broadcast::channel::<SessionEvent>(1024);
 
     let session = Arc::new(TerminalSession {
         id,
@@ -577,7 +859,9 @@ fn spawn_session(
     thread::spawn(move || {
         while let Ok(input) = input_rx.recv() {
             let payload = match input {
-                PtyInput::User(data) => encode_input_for_mode(&input_mode, &data),
+                PtyInput::User { data, pane_id } => {
+                    encode_input_for_mode(&input_mode, &data, pane_id.as_deref())
+                }
                 PtyInput::Raw(data) => data,
             };
             if payload.is_empty() {
@@ -603,7 +887,7 @@ fn read_direct_output(session: Arc<TerminalSession>, mut reader: Box<dyn Read + 
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => session.append_output(&buf[..n]),
+            Ok(n) => session.append_direct_output(&buf[..n]),
             Err(err) => {
                 warn!(session = %session.id, error = %err, "pty read failed");
                 break;
@@ -665,7 +949,7 @@ fn flush_tmux_startup_passthrough(
     let raw_chunk = pending.drain(..flush_len).collect::<Vec<_>>();
     let chunk = strip_tmux_control_wrappers(&raw_chunk);
     if !chunk.is_empty() {
-        session.append_output(&chunk);
+        session.append_direct_output(&chunk);
     }
 }
 
@@ -700,34 +984,161 @@ fn handle_tmux_control_line(
     }
 
     if !line.starts_with(b"%") {
+        if handle_tmux_state_line(session, state, line) {
+            return;
+        }
         let initialized = state
             .lock()
             .expect("tmux control state lock poisoned")
             .initialized;
         if !initialized {
-            session.append_output(line);
-            session.append_output(b"\r\n");
+            session.append_direct_output(line);
+            session.append_direct_output(b"\r\n");
         }
         return;
     }
 
-    state
-        .lock()
-        .expect("tmux control state lock poisoned")
-        .initialized = true;
+    let was_initialized = {
+        let mut state = state.lock().expect("tmux control state lock poisoned");
+        let was_initialized = state.initialized;
+        state.initialized = true;
+        was_initialized
+    };
+    if !was_initialized {
+        if let Err(err) = session.request_tmux_state_refresh() {
+            warn!(session = %session.id, error = %err, "failed to request tmux state");
+        }
+    }
 
     if let Some((pane, payload)) = parse_tmux_output_line(line) {
         {
             let mut state = state.lock().expect("tmux control state lock poisoned");
             if state.active_pane.is_none() {
-                state.active_pane = Some(pane);
+                state.active_pane = Some(pane.clone());
             }
+            state.upsert_pane_placeholder(&pane);
         }
         let decoded = decode_tmux_escaped_bytes(payload);
         if !decoded.is_empty() {
-            session.append_output(&decoded);
+            session.append_pane_output(&pane, &decoded);
+        }
+        broadcast_tmux_state(session);
+        return;
+    }
+
+    if is_tmux_structure_event(line) {
+        if let Err(err) = session.request_tmux_state_refresh() {
+            warn!(session = %session.id, error = %err, "failed to refresh tmux state after event");
         }
     }
+}
+
+fn handle_tmux_state_line(
+    session: &Arc<TerminalSession>,
+    state: &Arc<Mutex<TmuxControlState>>,
+    line: &[u8],
+) -> bool {
+    let Ok(text) = std::str::from_utf8(line) else {
+        return false;
+    };
+    if let Some(rest) = text.strip_prefix("WT_WINDOW\t") {
+        let parts = rest.splitn(5, '\t').collect::<Vec<_>>();
+        if parts.len() == 5 {
+            let generation = parts[0].parse::<u64>().ok();
+            let mut state = state.lock().expect("tmux control state lock poisoned");
+            if state.pending_generation == generation {
+                state.pending_windows.insert(
+                    parts[1].to_string(),
+                    TmuxWindow {
+                        id: parts[1].to_string(),
+                        index: parts[2].parse::<u16>().ok(),
+                        name: parts[3].to_string(),
+                        active: parts[4] == "1",
+                        panes: Vec::new(),
+                    },
+                );
+            }
+        }
+        return true;
+    }
+
+    if let Some(rest) = text.strip_prefix("WT_PANE\t") {
+        let parts = rest.splitn(7, '\t').collect::<Vec<_>>();
+        if parts.len() == 7 {
+            let generation = parts[0].parse::<u64>().ok();
+            let mut state = state.lock().expect("tmux control state lock poisoned");
+            if state.pending_generation == generation {
+                let pane = TmuxPane {
+                    window_id: parts[1].to_string(),
+                    id: parts[2].to_string(),
+                    index: parts[3].parse::<u16>().ok(),
+                    active: parts[4] == "1",
+                    current_command: parts[5].to_string(),
+                    current_path: parts[6].to_string(),
+                };
+                if pane.active {
+                    state.active_pane = Some(pane.id.clone());
+                }
+                state.pending_panes.insert(pane.id.clone(), pane);
+            }
+        }
+        return true;
+    }
+
+    if let Some(rest) = text.strip_prefix("WT_DONE\t") {
+        let generation = rest.trim().parse::<u64>().ok();
+        let snapshot = {
+            let mut state = state.lock().expect("tmux control state lock poisoned");
+            if state.pending_generation == generation {
+                let mut windows = std::mem::take(&mut state.pending_windows);
+                for pane in std::mem::take(&mut state.pending_panes).into_values() {
+                    windows
+                        .entry(pane.window_id.clone())
+                        .or_insert_with(|| TmuxWindow {
+                            id: pane.window_id.clone(),
+                            index: None,
+                            name: pane.window_id.clone(),
+                            active: false,
+                            panes: Vec::new(),
+                        })
+                        .panes
+                        .push(pane);
+                }
+                state.windows = windows.into_values().collect();
+                for window in &mut state.windows {
+                    window
+                        .panes
+                        .sort_by_key(|pane| pane.index.unwrap_or(u16::MAX));
+                }
+                state
+                    .windows
+                    .sort_by_key(|window| window.index.unwrap_or(u16::MAX));
+                state.pending_generation = None;
+                Some(state.snapshot())
+            } else {
+                None
+            }
+        };
+        if let Some(snapshot) = snapshot {
+            let _ = session.output_tx.send(SessionEvent::TmuxState(snapshot));
+        }
+        return true;
+    }
+
+    false
+}
+
+fn broadcast_tmux_state(session: &TerminalSession) {
+    if let Some(state) = session.tmux_state_snapshot() {
+        let _ = session.output_tx.send(SessionEvent::TmuxState(state));
+    }
+}
+
+fn is_tmux_structure_event(line: &[u8]) -> bool {
+    line.starts_with(b"%window-")
+        || line.starts_with(b"%layout-change")
+        || line.starts_with(b"%pane-")
+        || line.starts_with(b"%session-")
 }
 
 fn parse_tmux_output_line(line: &[u8]) -> Option<(String, &[u8])> {
@@ -783,7 +1194,7 @@ fn decode_tmux_escaped_bytes(input: &[u8]) -> Vec<u8> {
     output
 }
 
-fn encode_input_for_mode(mode: &InputMode, data: &[u8]) -> Vec<u8> {
+fn encode_input_for_mode(mode: &InputMode, data: &[u8], pane_override: Option<&str>) -> Vec<u8> {
     match mode {
         InputMode::Direct => data.to_vec(),
         InputMode::TmuxControl(state) => {
@@ -795,7 +1206,7 @@ fn encode_input_for_mode(mode: &InputMode, data: &[u8]) -> Vec<u8> {
                 state.active_pane.clone()
             };
 
-            if let Some(pane) = pane {
+            if let Some(pane) = pane_override.map(ToOwned::to_owned).or(pane) {
                 encode_tmux_control_input(&pane, data)
             } else {
                 data.to_vec()
@@ -1036,6 +1447,12 @@ fn sanitize_tmux_name(input: Option<&str>, id: &Uuid) -> String {
 
 fn short_id(id: Uuid) -> String {
     id.to_string()[..8].to_string()
+}
+
+fn tmux_target_arg(target: Option<&str>) -> String {
+    target
+        .map(|target| format!(" -t {target}"))
+        .unwrap_or_default()
 }
 
 fn shell_escape(value: &str) -> String {

@@ -24,6 +24,7 @@ import "./styles.css";
 
 type SessionMode = "local" | "ssh" | "local_cc" | "ssh_cc";
 type InteractionMode = "input" | "browse";
+type TmuxCommand = "new_window" | "split_horizontal" | "split_vertical" | "kill_pane";
 
 interface SessionSummary {
   id: string;
@@ -54,6 +55,33 @@ interface ResizeSessionPayload {
   cols: number;
   rows: number;
 }
+
+interface TmuxState {
+  active_pane: string | null;
+  windows: TmuxWindow[];
+}
+
+interface TmuxWindow {
+  id: string;
+  index: number | null;
+  name: string;
+  active: boolean;
+  panes: TmuxPane[];
+}
+
+interface TmuxPane {
+  id: string;
+  window_id: string;
+  index: number | null;
+  active: boolean;
+  current_command: string;
+  current_path: string;
+}
+
+type ServerMessage =
+  | { type: "clear" }
+  | { type: "focus_pane"; pane_id: string }
+  | { type: "tmux_state"; state: TmuxState };
 
 const api = {
   async listSessions(): Promise<SessionSummary[]> {
@@ -363,8 +391,11 @@ function TerminalPane({
   const wsRef = React.useRef<WebSocket | null>(null);
   const inputEnabledRef = React.useRef(true);
   const lastModeRef = React.useRef<InteractionMode>("input");
+  const encoderRef = React.useRef(new TextEncoder());
   const [connected, setConnected] = useState(false);
   const [interactionMode, setInteractionMode] = useState<InteractionMode>("input");
+  const [tmuxState, setTmuxState] = useState<TmuxState | null>(null);
+  const [focusedPane, setFocusedPane] = useState<string | null>(null);
   const controlMode = session.mode === "local_cc" || session.mode === "ssh_cc";
 
   useEffect(() => {
@@ -424,12 +455,14 @@ function TerminalPane({
       } else if (event.data instanceof Blob) {
         void event.data.arrayBuffer().then((buffer) => term.write(new Uint8Array(buffer)));
       } else {
-        term.write(String(event.data));
+        handleServerTextMessage(String(event.data), term, setTmuxState, setFocusedPane);
       }
     };
 
     const dataSub = term.onData((data) => {
-      if (inputEnabledRef.current && ws.readyState === WebSocket.OPEN) ws.send(data);
+      if (inputEnabledRef.current && ws.readyState === WebSocket.OPEN) {
+        ws.send(encoderRef.current.encode(data));
+      }
     });
 
     return () => {
@@ -550,7 +583,22 @@ function TerminalPane({
   const send = (value: string) => {
     if (interactionMode !== "input") return;
     const ws = wsRef.current;
-    if (ws?.readyState === WebSocket.OPEN) ws.send(value);
+    if (ws?.readyState === WebSocket.OPEN) ws.send(encoderRef.current.encode(value));
+  };
+
+  const focusPane = (paneId: string) => {
+    const ws = wsRef.current;
+    if (ws?.readyState !== WebSocket.OPEN) return;
+    setInteractionMode("input");
+    setFocusedPane(paneId);
+    termRef.current?.clear();
+    ws.send(JSON.stringify({ type: "focus_pane", pane_id: paneId }));
+  };
+
+  const sendTmuxCommand = (command: TmuxCommand) => {
+    const ws = wsRef.current;
+    if (ws?.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: "tmux_command", command }));
   };
 
   const copySelection = async () => {
@@ -573,6 +621,14 @@ function TerminalPane({
         </button>
         <Maximize2 size={15} />
       </div>
+      {controlMode && tmuxState && (
+        <TmuxNavigator
+          state={tmuxState}
+          focusedPane={focusedPane}
+          onFocusPane={focusPane}
+          onCommand={sendTmuxCommand}
+        />
+      )}
       <div
         ref={containerRef}
         className={`terminalSurface ${interactionMode === "browse" ? "browseMode" : "inputMode"}`}
@@ -604,6 +660,88 @@ function measureTerminalGrid(container: HTMLElement, term: Terminal): ResizeSess
     cols: clamp(Math.floor(width / cellWidth), 40, 240),
     rows: clamp(Math.floor(height / cellHeight), 12, 80),
   };
+}
+
+function handleServerTextMessage(
+  data: string,
+  term: Terminal,
+  setTmuxState: React.Dispatch<React.SetStateAction<TmuxState | null>>,
+  setFocusedPane: React.Dispatch<React.SetStateAction<string | null>>,
+) {
+  let message: ServerMessage;
+  try {
+    message = JSON.parse(data) as ServerMessage;
+  } catch {
+    term.write(data);
+    return;
+  }
+
+  if (message.type === "clear") {
+    term.clear();
+  } else if (message.type === "focus_pane") {
+    setFocusedPane(message.pane_id);
+  } else if (message.type === "tmux_state") {
+    setTmuxState(message.state);
+  }
+}
+
+function TmuxNavigator({
+  state,
+  focusedPane,
+  onFocusPane,
+  onCommand,
+}: {
+  state: TmuxState;
+  focusedPane: string | null;
+  onFocusPane: (paneId: string) => void;
+  onCommand: (command: TmuxCommand) => void;
+}) {
+  const activePane =
+    state.windows.flatMap((window) => window.panes).find((pane) => pane.id === focusedPane) ??
+    state.windows.flatMap((window) => window.panes).find((pane) => pane.id === state.active_pane) ??
+    null;
+
+  return (
+    <div className="tmuxNavigator">
+      <div className="tmuxWindows">
+        {state.windows.map((window) => (
+          <button
+            type="button"
+            key={window.id}
+            className={window.panes.some((pane) => pane.id === activePane?.id) ? "selected" : ""}
+            onClick={() => window.panes[0] && onFocusPane(window.panes[0].id)}
+          >
+            {window.index ?? "-"} {window.name || window.id}
+          </button>
+        ))}
+      </div>
+      <div className="tmuxPanes">
+        {state.windows.flatMap((window) =>
+          window.panes.map((pane) => (
+            <button
+              type="button"
+              key={pane.id}
+              className={pane.id === activePane?.id ? "selected" : ""}
+              onClick={() => onFocusPane(pane.id)}
+            >
+              {pane.id} {pane.current_command || "shell"}
+            </button>
+          )),
+        )}
+      </div>
+      <div className="tmuxActions">
+        <button type="button" onClick={() => onCommand("new_window")}>
+          +Tab
+        </button>
+        <button type="button" onClick={() => onCommand("split_horizontal")} disabled={!activePane}>
+          Split H
+        </button>
+        <button type="button" onClick={() => onCommand("split_vertical")} disabled={!activePane}>
+          Split V
+        </button>
+      </div>
+    </div>
+  );
 }
 
 function getFallbackCellWidth(term: Terminal): number {
