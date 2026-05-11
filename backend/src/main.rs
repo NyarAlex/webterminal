@@ -1243,9 +1243,9 @@ fn encode_tmux_control_input(pane: &str, data: &[u8]) -> Vec<u8> {
                     ("", 'F') | ("4", '~') | ("8", '~') => {
                         commands.push_str(&format!("send-keys -t {pane} End\n"));
                     }
-                    ("3", '~') => commands.push_str(&format!("send-keys -t {pane} Delete\n")),
-                    ("5", '~') => commands.push_str(&format!("send-keys -t {pane} PageUp\n")),
-                    ("6", '~') => commands.push_str(&format!("send-keys -t {pane} PageDown\n")),
+                    ("3", '~') => commands.push_str(&format!("send-keys -t {pane} DC\n")),
+                    ("5", '~') => commands.push_str(&format!("send-keys -t {pane} PPage\n")),
+                    ("6", '~') => commands.push_str(&format!("send-keys -t {pane} NPage\n")),
                     ("200", '~') | ("201", '~') => {}
                     _ => {}
                 }
@@ -1269,7 +1269,7 @@ fn encode_tmux_control_input(pane: &str, data: &[u8]) -> Vec<u8> {
             }
             '\u{7f}' | '\u{8}' => {
                 flush_tmux_literal(&mut commands, pane, &mut literal);
-                commands.push_str(&format!("send-keys -t {pane} BS\n"));
+                commands.push_str(&format!("send-keys -t {pane} BSpace\n"));
             }
             '\u{3}' => {
                 flush_tmux_literal(&mut commands, pane, &mut literal);
