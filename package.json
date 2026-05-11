@@ -1,0 +1,8 @@
+{
+  "scripts": {
+    "dev": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build && cargo build --manifest-path backend/Cargo.toml",
+    "backend": "cargo run --manifest-path backend/Cargo.toml",
+    "frontend": "npm --prefix frontend run dev"
+  }
+}

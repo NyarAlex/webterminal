@@ -1,0 +1,14 @@
+services:
+  webterminal:
+    build: .
+    ports:
+      - "8787:8787"
+    volumes:
+      - ~/.ssh:/root/.ssh:ro
+      - webterminal-data:/app/data
+    environment:
+      WEBTERMINAL_ADDR: 0.0.0.0:8787
+      WEBTERMINAL_STATIC_DIR: /app/frontend/dist
+
+volumes:
+  webterminal-data:
