@@ -94,6 +94,19 @@ const api = {
   },
 };
 
+function sessionModeLabel(mode: SessionMode): string {
+  switch (mode) {
+    case "local_cc":
+      return "tmux -CC";
+    case "ssh_cc":
+      return "SSH -CC";
+    case "local":
+      return "tmux legacy";
+    case "ssh":
+      return "SSH legacy";
+  }
+}
+
 function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -190,7 +203,8 @@ function App() {
                 <span className="sessionText">
                   <strong>{session.name}</strong>
                   <small>
-                    {session.cols}x{session.rows} · {session.viewers} viewers
+                    {sessionModeLabel(session.mode)} · {session.cols}x{session.rows} ·{" "}
+                    {session.viewers} viewers
                   </small>
                 </span>
                 <ChevronRight size={15} />
@@ -213,7 +227,7 @@ function App() {
           <div className="topbarActions">
             {active && (
               <>
-                <span className="statusPill">{active.mode}</span>
+                <span className="statusPill">{sessionModeLabel(active.mode)}</span>
                 <span className="statusPill">{active.cols}x{active.rows}</span>
                 <button
                   className="iconButton"
@@ -250,7 +264,7 @@ function App() {
               <Smartphone size={28} />
             </div>
             <h2>Create a terminal session</h2>
-            <p>Start locally with tmux, then connect the same session from phone and desktop.</p>
+            <p>Start with tmux -CC, then reconnect from phone and desktop.</p>
             <button className="primaryButton compact" onClick={() => setFormOpen(true)}>
               <Plus size={17} />
               New session
@@ -696,7 +710,7 @@ function CreateSessionDialog({
   onClose: () => void;
   onCreate: (payload: CreateSessionPayload) => Promise<void>;
 }) {
-  const [mode, setMode] = useState<SessionMode>("local");
+  const [mode, setMode] = useState<SessionMode>("local_cc");
   const [name, setName] = useState("");
   const [tmuxName, setTmuxName] = useState("");
   const [host, setHost] = useState("");
@@ -753,22 +767,6 @@ function CreateSessionDialog({
           <div className="segmented">
             <button
               type="button"
-              className={mode === "local" ? "selected" : ""}
-              disabled={submitting}
-              onClick={() => setMode("local")}
-            >
-              Local tmux
-            </button>
-            <button
-              type="button"
-              className={mode === "ssh" ? "selected" : ""}
-              disabled={submitting}
-              onClick={() => setMode("ssh")}
-            >
-              SSH tmux
-            </button>
-            <button
-              type="button"
               className={mode === "local_cc" ? "selected" : ""}
               disabled={submitting}
               onClick={() => setMode("local_cc")}
@@ -782,6 +780,22 @@ function CreateSessionDialog({
               onClick={() => setMode("ssh_cc")}
             >
               SSH -CC
+            </button>
+            <button
+              type="button"
+              className={mode === "local" ? "selected" : ""}
+              disabled={submitting}
+              onClick={() => setMode("local")}
+            >
+              Local legacy
+            </button>
+            <button
+              type="button"
+              className={mode === "ssh" ? "selected" : ""}
+              disabled={submitting}
+              onClick={() => setMode("ssh")}
+            >
+              SSH legacy
             </button>
           </div>
         </label>

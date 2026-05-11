@@ -645,10 +645,32 @@ fn flush_tmux_startup_passthrough(
         .iter()
         .position(|b| *b == b'%')
         .unwrap_or(pending.len());
-    let chunk = pending.drain(..flush_len).collect::<Vec<_>>();
+    let raw_chunk = pending.drain(..flush_len).collect::<Vec<_>>();
+    let chunk = strip_tmux_control_wrappers(&raw_chunk);
     if !chunk.is_empty() {
         session.append_output(&chunk);
     }
+}
+
+fn strip_tmux_control_wrappers(input: &[u8]) -> Vec<u8> {
+    const CONTROL_START: &[u8] = b"\x1bP1000p";
+    const CONTROL_END: &[u8] = b"\x1b\\";
+
+    let mut output = Vec::with_capacity(input.len());
+    let mut index = 0;
+
+    while index < input.len() {
+        if input[index..].starts_with(CONTROL_START) {
+            index += CONTROL_START.len();
+        } else if input[index..].starts_with(CONTROL_END) {
+            index += CONTROL_END.len();
+        } else {
+            output.push(input[index]);
+            index += 1;
+        }
+    }
+
+    output
 }
 
 fn handle_tmux_control_line(
@@ -877,7 +899,7 @@ fn build_command(id: Uuid, tmux_name: &str, req: CreateSessionRequest) -> Result
         });
     }
 
-    match req.mode.unwrap_or(CreateMode::Local) {
+    match req.mode.unwrap_or(CreateMode::LocalCc) {
         CreateMode::Local => {
             let name = req
                 .name
