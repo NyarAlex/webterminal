@@ -439,7 +439,7 @@ function TerminalPane({
       termRef.current = null;
       wsRef.current = null;
     };
-  }, [session.id, session.cols, session.rows]);
+  }, [session.id]);
 
   useEffect(() => {
     inputEnabledRef.current = interactionMode === "input";

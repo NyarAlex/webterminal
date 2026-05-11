@@ -87,7 +87,7 @@ struct TerminalSession {
     mode: SessionMode,
     size: Mutex<PtySize>,
     created_at: DateTime<Utc>,
-    input_tx: mpsc::Sender<Vec<u8>>,
+    input_tx: mpsc::Sender<PtyInput>,
     input_mode: InputMode,
     output_tx: broadcast::Sender<Vec<u8>>,
     replay: Mutex<ReplayBuffer>,
@@ -100,6 +100,11 @@ struct TerminalSession {
 enum InputMode {
     Direct,
     TmuxControl(Arc<Mutex<TmuxControlState>>),
+}
+
+enum PtyInput {
+    User(Vec<u8>),
+    Raw(Vec<u8>),
 }
 
 #[derive(Default)]
@@ -125,7 +130,13 @@ impl TerminalSession {
 
     fn write_input(&self, data: Vec<u8>) -> Result<()> {
         self.input_tx
-            .send(data)
+            .send(PtyInput::User(data))
+            .map_err(|_| anyhow!("terminal input channel is closed"))
+    }
+
+    fn write_raw_input(&self, data: Vec<u8>) -> Result<()> {
+        self.input_tx
+            .send(PtyInput::Raw(data))
             .map_err(|_| anyhow!("terminal input channel is closed"))
     }
 
@@ -155,6 +166,9 @@ impl TerminalSession {
             .resize(size)
             .context("failed to resize pty")?;
         *self.size.lock().expect("size lock poisoned") = size;
+        if matches!(self.input_mode, InputMode::TmuxControl(_)) {
+            self.write_raw_input(format!("refresh-client -C {cols},{rows}\n").into_bytes())?;
+        }
         Ok(())
     }
 
@@ -526,7 +540,7 @@ fn spawn_session(
         .take_writer()
         .context("failed to take pty writer")?;
 
-    let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
+    let (input_tx, input_rx) = mpsc::channel::<PtyInput>();
     let (output_tx, _) = broadcast::channel::<Vec<u8>>(1024);
 
     let session = Arc::new(TerminalSession {
@@ -561,8 +575,11 @@ fn spawn_session(
     let input_session = Arc::clone(&session);
     let input_mode = session.input_mode.clone();
     thread::spawn(move || {
-        while let Ok(data) = input_rx.recv() {
-            let payload = encode_input_for_mode(&input_mode, &data);
+        while let Ok(input) = input_rx.recv() {
+            let payload = match input {
+                PtyInput::User(data) => encode_input_for_mode(&input_mode, &data),
+                PtyInput::Raw(data) => data,
+            };
             if payload.is_empty() {
                 continue;
             }
