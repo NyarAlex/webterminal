@@ -14,8 +14,9 @@
 html,
 body,
 #root {
-  height: 100%;
+  height: var(--app-height, 100dvh);
   margin: 0;
+  overflow: hidden;
 }
 
 button,
@@ -36,9 +37,13 @@ input:disabled {
 .appShell {
   display: grid;
   grid-template-columns: 300px minmax(0, 1fr);
-  height: 100%;
-  min-height: 100dvh;
+  height: var(--app-height, 100dvh);
+  min-height: 0;
   background: #111417;
+}
+
+.appShell.sidebarCollapsed {
+  grid-template-columns: 58px minmax(0, 1fr);
 }
 
 .sidebar {
@@ -49,6 +54,11 @@ input:disabled {
   padding: 18px;
   border-right: 1px solid #273039;
   background: #171b1f;
+}
+
+.sidebarCollapsed .sidebar {
+  gap: 12px;
+  padding: 10px 8px;
 }
 
 .brand {
@@ -143,6 +153,54 @@ input:disabled {
   display: none;
 }
 
+.sidebarCollapseButton {
+  margin-left: auto;
+}
+
+.sidebarCollapsed .brand {
+  justify-content: center;
+}
+
+.sidebarCollapsed .brand > div:not(.brandMark),
+.sidebarCollapsed .sidebarHeader span,
+.sidebarCollapsed .newSessionButton span,
+.sidebarCollapsed .sessionText,
+.sidebarCollapsed .sessionMenuToggle,
+.sidebarCollapsed .sessionMenu {
+  display: none;
+}
+
+.sidebarCollapsed .sidebarCollapseButton {
+  position: absolute;
+  top: 56px;
+  left: 12px;
+  width: 34px;
+  height: 34px;
+}
+
+.sidebarCollapsed .newSessionButton {
+  width: 40px;
+  min-height: 36px;
+  padding: 0;
+  align-self: center;
+}
+
+.sidebarCollapsed .sidebarHeader {
+  justify-content: center;
+}
+
+.sidebarCollapsed .sessionItem {
+  grid-template-columns: 40px;
+  justify-content: center;
+  padding: 3px;
+}
+
+.sidebarCollapsed .sessionMain {
+  grid-template-columns: 34px;
+  justify-content: center;
+  padding: 2px;
+}
+
 .sidebarHeader,
 .topbar,
 .terminalChrome,
@@ -169,21 +227,82 @@ input:disabled {
 
 .sessionItem {
   display: grid;
-  grid-template-columns: 34px minmax(0, 1fr) 16px;
+  grid-template-columns: minmax(0, 1fr) 34px;
   align-items: center;
-  gap: 10px;
+  gap: 4px;
   width: 100%;
-  padding: 10px;
+  padding: 8px;
   border: 1px solid transparent;
   border-radius: 8px;
   background: transparent;
   color: #dce5e9;
   text-align: left;
+  position: relative;
 }
 
 .sessionItem.active {
   border-color: #465765;
   background: #222a30;
+}
+
+.sessionItem.menuOpen {
+  border-color: #536677;
+}
+
+.sessionMain {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 2px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.sessionMenuToggle {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: #dce5e9;
+}
+
+.sessionMenuToggle:hover,
+.sessionMenuToggle:focus-visible {
+  border-color: #465765;
+  background: #151b20;
+}
+
+.sessionMenu {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: flex-end;
+  padding: 4px 0 0;
+}
+
+.sessionMenu button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid #465765;
+  border-radius: 7px;
+  background: #151b20;
+  color: #dce5e9;
+  font-weight: 700;
+}
+
+.sessionMenu button:hover,
+.sessionMenu button:focus-visible {
+  border-color: #d8af45;
+  color: #f3c969;
 }
 
 .sessionIcon {
@@ -269,6 +388,10 @@ input:disabled {
 }
 
 .errorBanner {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  justify-content: space-between;
   margin: 12px 16px 0;
   padding: 10px 12px;
   border: 1px solid #8c4741;
@@ -277,18 +400,42 @@ input:disabled {
   color: #ffb0a8;
 }
 
+.errorBanner span,
+.formError span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.messageClose {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid rgba(255, 176, 168, 0.35);
+  border-radius: 6px;
+  background: transparent;
+  color: #ffb0a8;
+}
+
 .terminalWrap {
   display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto auto auto auto minmax(0, 1fr);
   flex: 1;
+  min-width: 0;
   min-height: 0;
+  overflow: hidden;
   background: #101315;
 }
 
 .terminalChrome {
+  grid-row: 1;
   gap: 10px;
-  min-height: 34px;
   min-width: 0;
+  max-width: 100%;
+  min-height: 34px;
   padding: 0 12px;
   border-bottom: 1px solid #263038;
   color: #9aa8b0;
@@ -322,13 +469,37 @@ input:disabled {
 }
 
 .terminalTools {
+  grid-row: 2;
   display: flex;
   gap: 8px;
   align-items: center;
   min-width: 0;
-  padding: 5px 8px;
+  max-width: 100%;
+  padding: 4px 8px;
   border-bottom: 1px solid #263038;
   background: #11171a;
+}
+
+.fileNotice {
+  grid-row: 3;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+  max-width: 100%;
+  padding: 6px 8px;
+  border-bottom: 1px solid #263038;
+  background: #182229;
+  color: #bdd4df;
+  font-size: 12px;
+}
+
+.fileNotice span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .modeSwitch {
@@ -379,6 +550,12 @@ input:disabled {
   font-family: ui-monospace, Menlo, Monaco, Consolas, monospace;
 }
 
+@media (min-width: 761px) {
+  .terminalCommand {
+    display: none;
+  }
+}
+
 .connected {
   color: #8fd58b;
 }
@@ -388,12 +565,14 @@ input:disabled {
 }
 
 .tmuxNavigator {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr) auto;
+  grid-row: 4;
+  display: flex;
   gap: 6px;
   align-items: center;
-  min-height: 38px;
-  padding: 5px 8px;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 34px;
+  padding: 4px 8px;
   border-bottom: 1px solid #263038;
   background: #12171a;
 }
@@ -408,14 +587,24 @@ input:disabled {
   scrollbar-width: thin;
 }
 
+.tmuxWindows {
+  flex: 0 1 auto;
+  max-width: 42%;
+}
+
+.tmuxPanes {
+  flex: 1 1 auto;
+}
+
 .tmuxActions {
+  flex: 0 0 auto;
   justify-content: flex-end;
 }
 
 .tmuxChip {
   display: inline-flex;
   flex: 0 0 auto;
-  max-width: 190px;
+  max-width: 150px;
   overflow: hidden;
   border: 1px solid #34414a;
   border-radius: 7px;
@@ -429,8 +618,8 @@ input:disabled {
 
 .tmuxNavigator button {
   flex: 0 0 auto;
-  min-height: 28px;
-  padding: 0 9px;
+  min-height: 26px;
+  padding: 0 7px;
   overflow: hidden;
   border: 0;
   background: transparent;
@@ -447,16 +636,18 @@ input:disabled {
 .tmuxNavigator .noteButton {
   display: inline-grid;
   place-items: center;
-  width: 28px;
+  width: 26px;
   padding: 0;
   border-left: 1px solid #34414a;
   color: #82919a;
 }
 
 .terminalSurface {
+  grid-row: 5;
   min-height: 0;
   padding: 8px;
   overflow: auto;
+  overscroll-behavior: contain;
   user-select: text;
   -webkit-user-select: text;
 }
@@ -469,8 +660,8 @@ input:disabled {
   pointer-events: none;
 }
 
-.terminalSurface.browseMode .xterm-viewport,
-.terminalSurface.browseMode .xterm-screen {
+.terminalSurface .xterm-viewport,
+.terminalSurface .xterm-screen {
   touch-action: pan-x pan-y;
 }
 
@@ -478,8 +669,165 @@ input:disabled {
   cursor: grab;
 }
 
+.desktopPaneGrid {
+  position: relative;
+  grid-row: 5;
+  display: none;
+  min-height: 0;
+  max-width: 100%;
+  overflow: hidden;
+  background: #101315;
+}
+
+.desktopPaneGrid.fallback {
+  gap: 6px;
+  padding: 6px;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  grid-auto-rows: minmax(220px, 1fr);
+}
+
+.desktopPane {
+  position: absolute;
+  min-width: 160px;
+  min-height: 120px;
+  overflow: hidden;
+  border: 0;
+  outline: 1px solid #2b363d;
+  outline-offset: 0;
+  background: #101315;
+}
+
+.desktopPaneGrid.fallback .desktopPane {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+}
+
+.desktopPane.selected {
+  outline-color: #d5a93d;
+}
+
+.desktopPaneLabel {
+  position: absolute;
+  top: 5px;
+  right: 8px;
+  z-index: 2;
+  max-width: calc(100% - 16px);
+  overflow: hidden;
+  padding: 2px 6px;
+  border: 1px solid #34414a;
+  border-radius: 6px;
+  background: rgba(16, 19, 21, 0.88);
+  color: #9aa8b0;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.desktopPane.selected .desktopPaneLabel {
+  border-color: #d5a93d;
+  color: #f3c969;
+}
+
+.desktopPaneSurface {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.desktopPaneSurface .xterm {
+  height: 100%;
+}
+
+.desktopPaneSurface .xterm-viewport {
+  scrollbar-width: none;
+}
+
+.desktopPaneSurface .xterm-viewport::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+.paneResizeHandle {
+  position: absolute;
+  z-index: 3;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  opacity: 0;
+}
+
+.desktopPane.selected .paneResizeHandle,
+.desktopPane:hover .paneResizeHandle {
+  opacity: 1;
+}
+
+.paneResizeHandle::after {
+  content: "";
+  position: absolute;
+  background: rgba(213, 169, 61, 0.85);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.paneResizeHandle:hover::after,
+.paneResizeHandle:focus-visible::after {
+  opacity: 1;
+}
+
+.paneResizeHandleLeft,
+.paneResizeHandleRight {
+  top: 0;
+  bottom: 0;
+  width: 8px;
+  cursor: ew-resize;
+}
+
+.paneResizeHandleLeft {
+  left: -4px;
+}
+
+.paneResizeHandleRight {
+  right: -4px;
+}
+
+.paneResizeHandleLeft::after,
+.paneResizeHandleRight::after {
+  top: 10px;
+  bottom: 10px;
+  left: 3px;
+  width: 2px;
+}
+
+.paneResizeHandleTop,
+.paneResizeHandleBottom {
+  left: 0;
+  right: 0;
+  height: 8px;
+  cursor: ns-resize;
+}
+
+.paneResizeHandleTop {
+  top: -4px;
+}
+
+.paneResizeHandleBottom {
+  bottom: -4px;
+}
+
+.paneResizeHandleTop::after,
+.paneResizeHandleBottom::after {
+  top: 3px;
+  right: 10px;
+  left: 10px;
+  height: 2px;
+}
+
 .mobileKeybar {
-  display: flex;
+  grid-row: 5;
+  display: none;
   gap: 6px;
   align-items: center;
   min-height: 46px;
@@ -565,6 +913,10 @@ input:disabled {
 }
 
 .formError {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  justify-content: space-between;
   padding: 10px 12px;
   border: 1px solid #8c4741;
   border-radius: 7px;
@@ -631,15 +983,18 @@ input:disabled {
 }
 
 @media (max-width: 760px) {
-  .appShell {
+  .appShell,
+  .appShell.sidebarCollapsed {
     grid-template-columns: 1fr;
   }
 
-  .sidebar {
+  .sidebar,
+  .sidebarCollapsed .sidebar {
     position: fixed;
     inset: 0 auto 0 0;
     z-index: 30;
     display: flex;
+    gap: 18px;
     width: min(330px, calc(100vw - 42px));
     max-width: 100%;
     padding: 12px;
@@ -670,8 +1025,30 @@ input:disabled {
     display: inline-grid;
   }
 
+  .sidebarCollapseButton {
+    display: none;
+  }
+
   .drawerClose {
     margin-left: auto;
+  }
+
+  .sidebarCollapsed .brand {
+    justify-content: flex-start;
+  }
+
+  .sidebarCollapsed .brand > div:not(.brandMark),
+  .sidebarCollapsed .newSessionButton span,
+  .sidebarCollapsed .sessionText {
+    display: block;
+  }
+
+  .sidebarCollapsed .sessionMenuToggle {
+    display: grid;
+  }
+
+  .sidebarCollapsed .sessionMenu {
+    display: flex;
   }
 
   .brand p,
@@ -693,9 +1070,19 @@ input:disabled {
     overflow-y: auto;
   }
 
-  .sessionItem {
+  .sessionItem,
+  .sidebarCollapsed .sessionItem {
+    grid-template-columns: minmax(0, 1fr) 34px;
     width: 100%;
     flex: none;
+    justify-content: stretch;
+    padding: 8px;
+  }
+
+  .sidebarCollapsed .sessionMain {
+    grid-template-columns: 34px minmax(0, 1fr);
+    justify-content: stretch;
+    padding: 2px;
   }
 
   .workspace {
@@ -734,20 +1121,51 @@ input:disabled {
   }
 
   .tmuxNavigator {
-    grid-template-columns: 1fr;
+    flex-direction: column;
     align-items: stretch;
     padding: 5px;
+  }
+
+  .tmuxWindows,
+  .tmuxPanes {
+    max-width: none;
   }
 
   .tmuxActions {
     justify-content: flex-start;
   }
 
+  .mobileKeybar {
+    display: flex;
+  }
+
   .terminalSurface {
     padding: 4px;
   }
 
+  .terminalSurface.desktopSplitHidden {
+    display: block;
+  }
+
+  .desktopPaneGrid {
+    display: none;
+  }
+
   .formGrid {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (min-width: 761px) {
+  .terminalSurface.desktopSplitHidden {
+    display: none;
+  }
+
+  .desktopPaneGrid {
+    display: block;
+  }
+
+  .desktopPaneGrid.fallback {
+    display: grid;
   }
 }

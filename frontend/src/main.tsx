@@ -7,16 +7,19 @@ import {
   Circle,
   Command,
   Copy,
-  Keyboard,
+  Download,
   Maximize2,
   Menu,
   Monitor,
+  PanelLeftClose,
+  PanelLeftOpen,
   Pencil,
   Plus,
   RefreshCw,
   Server,
   Smartphone,
   Trash2,
+  Upload,
   Wifi,
   X,
 } from "lucide-react";
@@ -28,6 +31,138 @@ import "./styles.css";
 type SessionMode = "local" | "ssh" | "local_cc" | "ssh_cc";
 type InteractionMode = "input" | "browse";
 type TmuxCommand = "new_window" | "split_horizontal" | "split_vertical" | "kill_pane";
+type ResizeDirection = "left" | "right" | "up" | "down";
+
+const ACTIVE_SESSION_STORAGE_KEY = "webterminal.activeSession";
+const SIDEBAR_COLLAPSED_STORAGE_KEY = "webterminal.sidebarCollapsed";
+const MAX_UPLOAD_BYTES = 24 * 1024 * 1024;
+const FILE_UPLOAD_CHUNK_CHARS = 2048;
+const DESKTOP_PANE_EDGE_GUARD_PX = 24;
+const DESKTOP_PANE_SEPARATOR_GAP_PX = 24;
+
+function focusedPaneStorageKey(sessionId: string): string {
+  return `webterminal.focusedPane.${sessionId}`;
+}
+
+function readStoredValue(key: string): string | null {
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredValue(key: string, value: string | null) {
+  try {
+    if (value) {
+      window.localStorage.setItem(key, value);
+    } else {
+      window.localStorage.removeItem(key);
+    }
+  } catch {
+    // Ignore private-mode or quota failures; remembering focus is a convenience.
+  }
+}
+
+function scrollTerminalToBottomSoon(term: Terminal) {
+  term.scrollToBottom();
+  window.requestAnimationFrame(() => term.scrollToBottom());
+}
+
+function attachTerminalKeyHandlers(term: Terminal, sendData: (data: string) => void) {
+  term.attachCustomKeyEventHandler((event) => {
+    if (event.type === "keydown" && event.key === "Enter" && event.shiftKey) {
+      sendData("\n");
+      return false;
+    }
+    return true;
+  });
+}
+
+function attachPasteHandler(container: HTMLElement, sendPaste: (data: string) => void) {
+  const onPaste = (event: ClipboardEvent) => {
+    const text = event.clipboardData?.getData("text/plain") ?? "";
+    if (!text) return;
+    event.preventDefault();
+    event.stopPropagation();
+    sendPaste(text);
+  };
+
+  container.addEventListener("paste", onPaste, { capture: true });
+  return () => container.removeEventListener("paste", onPaste, { capture: true });
+}
+
+function makeTransferId(): string {
+  return window.crypto?.randomUUID?.() ?? `wt-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function decodeBase64Text(value: string): string {
+  const bytes = Uint8Array.from(window.atob(value), (char) => char.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+function base64ToBlob(value: string): Blob {
+  const parts: BlobPart[] = [];
+  for (let offset = 0; offset < value.length; offset += 32768) {
+    const slice = value.slice(offset, offset + 32768);
+    const bytes = Uint8Array.from(window.atob(slice), (char) => char.charCodeAt(0));
+    parts.push(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+  }
+  return new Blob(parts, { type: "application/octet-stream" });
+}
+
+function triggerBrowserDownload(filename: string, dataBase64: string) {
+  const blob = base64ToBlob(dataBase64);
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename || "download";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
+}
+
+function readFileAsBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("Failed to read file"));
+    reader.onload = () => {
+      const result = String(reader.result ?? "");
+      const comma = result.indexOf(",");
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function chooseLocalFile(): Promise<File | null> {
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.style.display = "none";
+    input.onchange = () => {
+      resolve(input.files?.[0] ?? null);
+      input.remove();
+    };
+    document.body.appendChild(input);
+    input.click();
+  });
+}
+
+function waitForSocketBuffer(ws: WebSocket): Promise<void> {
+  if (ws.bufferedAmount < 512 * 1024) return Promise.resolve();
+  return new Promise((resolve) => {
+    const tick = () => {
+      if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount < 512 * 1024) {
+        resolve();
+      } else {
+        window.setTimeout(tick, 25);
+      }
+    };
+    tick();
+  });
+}
 
 interface SessionSummary {
   id: string;
@@ -38,6 +173,7 @@ interface SessionSummary {
   rows: number;
   created_at: string;
   viewers: number;
+  alive: boolean;
 }
 
 interface CreateSessionPayload {
@@ -79,17 +215,29 @@ interface TmuxPane {
   active: boolean;
   current_command: string;
   current_path: string;
-}
-
-interface TmuxAnnotations {
-  windows: Record<string, string>;
-  panes: Record<string, string>;
+  note?: string | null;
+  left?: number | null;
+  top?: number | null;
+  width?: number | null;
+  height?: number | null;
 }
 
 type ServerMessage =
   | { type: "clear" }
   | { type: "focus_pane"; pane_id: string }
-  | { type: "tmux_state"; state: TmuxState };
+  | { type: "tmux_state"; state: TmuxState }
+  | {
+      type: "file_download";
+      id: string;
+      filename_base64: string;
+      data_base64: string;
+    }
+  | {
+      type: "file_transfer_status";
+      id: string;
+      status: "ok" | "error" | string;
+      message: string;
+    };
 
 const api = {
   async listSessions(): Promise<SessionSummary[]> {
@@ -114,6 +262,15 @@ const api = {
   async deleteSession(id: string): Promise<void> {
     const res = await fetch(`/api/sessions/${id}`, { method: "DELETE" });
     if (!res.ok && res.status !== 404) throw new Error("Failed to delete session");
+  },
+
+  async reconnectSession(id: string): Promise<SessionSummary> {
+    const res = await fetch(`/api/sessions/${id}/reconnect`, { method: "POST" });
+    if (!res.ok) {
+      const body = await res.json().catch(() => null);
+      throw new Error(body?.error ?? "Failed to reconnect session");
+    }
+    return res.json();
   },
 
   async resizeSession(id: string, payload: ResizeSessionPayload): Promise<SessionSummary> {
@@ -143,31 +300,18 @@ function sessionModeLabel(mode: SessionMode): string {
   }
 }
 
-function annotationStorageKey(scope: string): string {
-  return `webterminal.annotations.${scope}`;
-}
-
-function loadAnnotations(scope: string): TmuxAnnotations {
-  try {
-    const raw = window.localStorage.getItem(annotationStorageKey(scope));
-    if (!raw) return { windows: {}, panes: {} };
-    const parsed = JSON.parse(raw) as Partial<TmuxAnnotations>;
-    return { windows: parsed.windows ?? {}, panes: parsed.panes ?? {} };
-  } catch {
-    return { windows: {}, panes: {} };
-  }
-}
-
-function saveAnnotations(scope: string, annotations: TmuxAnnotations) {
-  window.localStorage.setItem(annotationStorageKey(scope), JSON.stringify(annotations));
-}
-
 function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const [activeId, setActiveId] = useState<string | null>(null);
+  const [activeId, setActiveId] = useState<string | null>(() =>
+    readStoredValue(ACTIVE_SESSION_STORAGE_KEY),
+  );
   const [formOpen, setFormOpen] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(
+    () => readStoredValue(SIDEBAR_COLLAPSED_STORAGE_KEY) === "true",
+  );
   const [sessionActionsOpen, setSessionActionsOpen] = useState(false);
+  const [sessionMenuId, setSessionMenuId] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<SessionSummary | null>(null);
   const [resizeToken, setResizeToken] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -180,7 +324,12 @@ function App() {
   const refresh = async () => {
     const next = await api.listSessions();
     setSessions(next);
-    setActiveId((current) => current ?? next[0]?.id ?? null);
+    setActiveId((current) => {
+      if (current && next.some((session) => session.id === current)) return current;
+      const stored = readStoredValue(ACTIVE_SESSION_STORAGE_KEY);
+      if (stored && next.some((session) => session.id === stored)) return stored;
+      return next[0]?.id ?? null;
+    });
   };
 
   useEffect(() => {
@@ -188,14 +337,46 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const viewport = window.visualViewport;
+    const updateAppHeight = () => {
+      const height = viewport?.height ?? window.innerHeight;
+      document.documentElement.style.setProperty("--app-height", `${height}px`);
+    };
+
+    updateAppHeight();
+    viewport?.addEventListener("resize", updateAppHeight);
+    viewport?.addEventListener("scroll", updateAppHeight);
+    window.addEventListener("resize", updateAppHeight);
+    window.addEventListener("orientationchange", updateAppHeight);
+
+    return () => {
+      viewport?.removeEventListener("resize", updateAppHeight);
+      viewport?.removeEventListener("scroll", updateAppHeight);
+      window.removeEventListener("resize", updateAppHeight);
+      window.removeEventListener("orientationchange", updateAppHeight);
+      document.documentElement.style.removeProperty("--app-height");
+    };
+  }, []);
+
+  useEffect(() => {
     setSessionActionsOpen(false);
+    setSessionMenuId(null);
   }, [activeId]);
+
+  useEffect(() => {
+    writeStoredValue(ACTIVE_SESSION_STORAGE_KEY, activeId);
+  }, [activeId]);
+
+  useEffect(() => {
+    writeStoredValue(SIDEBAR_COLLAPSED_STORAGE_KEY, sidebarCollapsed ? "true" : null);
+  }, [sidebarCollapsed]);
 
   const createSession = async (payload: CreateSessionPayload) => {
     setError(null);
     const session = await api.createSession(payload);
     await refresh();
     setActiveId(session.id);
+    writeStoredValue(ACTIVE_SESSION_STORAGE_KEY, session.id);
     setFormOpen(false);
     setDrawerOpen(false);
   };
@@ -207,6 +388,17 @@ function App() {
     if (activeId === id) setActiveId(next[0]?.id ?? null);
   };
 
+  const reconnectSession = async (id: string) => {
+    setError(null);
+    try {
+      const session = await api.reconnectSession(id);
+      updateSession(session);
+      setSessionMenuId(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
   const updateSession = useCallback((nextSession: SessionSummary) => {
     setSessions((current) =>
       current.map((session) => (session.id === nextSession.id ? nextSession : session)),
@@ -214,7 +406,7 @@ function App() {
   }, []);
 
   return (
-    <main className="appShell">
+    <main className={`appShell ${sidebarCollapsed ? "sidebarCollapsed" : ""}`}>
       <aside className={`sidebar ${drawerOpen ? "open" : ""}`}>
         <div className="brand">
           <div className="brandMark">
@@ -227,11 +419,18 @@ function App() {
           <button className="iconButton drawerClose" title="Close sessions" onClick={() => setDrawerOpen(false)}>
             <X size={17} />
           </button>
+          <button
+            className="iconButton sidebarCollapseButton"
+            title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            onClick={() => setSidebarCollapsed((collapsed) => !collapsed)}
+          >
+            {sidebarCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
+          </button>
         </div>
 
-        <button className="primaryButton" onClick={() => setFormOpen(true)}>
+        <button className="primaryButton newSessionButton" title="New session" onClick={() => setFormOpen(true)}>
           <Plus size={17} />
-          New session
+          <span>New session</span>
         </button>
 
         <div className="sidebarHeader">
@@ -249,26 +448,49 @@ function App() {
             </div>
           ) : (
             sessions.map((session) => (
-              <button
+              <div
                 key={session.id}
-                className={`sessionItem ${session.id === activeId ? "active" : ""}`}
-                onClick={() => {
-                  setActiveId(session.id);
-                  setDrawerOpen(false);
-                }}
+                className={`sessionItem ${session.id === activeId ? "active" : ""} ${sessionMenuId === session.id ? "menuOpen" : ""}`}
+                title={`${session.name} · ${sessionModeLabel(session.mode)} · ${session.cols}x${session.rows}`}
               >
-                <span className="sessionIcon">
-                  {session.mode.includes("ssh") ? <Wifi size={16} /> : <Monitor size={16} />}
-                </span>
-                <span className="sessionText">
-                  <strong>{session.name}</strong>
-                  <small>
-                    {sessionModeLabel(session.mode)} · {session.cols}x{session.rows} ·{" "}
-                    {session.viewers} viewers
-                  </small>
-                </span>
-                <ChevronRight size={15} />
-              </button>
+                <button
+                  type="button"
+                  className="sessionMain"
+                  onClick={() => {
+                    setActiveId(session.id);
+                    setDrawerOpen(false);
+                  }}
+                >
+                  <span className="sessionIcon">
+                    {session.mode.includes("ssh") ? <Wifi size={16} /> : <Monitor size={16} />}
+                  </span>
+                  <span className="sessionText">
+                    <strong>{session.name}</strong>
+                    <small>
+                      {session.alive ? sessionModeLabel(session.mode) : "disconnected"} · {session.cols}x{session.rows} ·{" "}
+                      {session.viewers} viewers
+                    </small>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  className="sessionMenuToggle"
+                  title="Session actions"
+                  onClick={() =>
+                    setSessionMenuId((current) => (current === session.id ? null : session.id))
+                  }
+                >
+                  {sessionMenuId === session.id ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+                </button>
+                {sessionMenuId === session.id && (
+                  <div className="sessionMenu">
+                    <button type="button" onClick={() => void reconnectSession(session.id)}>
+                      <RefreshCw size={14} />
+                      Reconnect session
+                    </button>
+                  </div>
+                )}
+              </div>
             ))
           )}
         </div>
@@ -281,7 +503,7 @@ function App() {
             <button className="iconButton drawerToggle" title="Sessions" onClick={() => setDrawerOpen(true)}>
               <Menu size={17} />
             </button>
-            <Circle className={active ? "liveDot" : "idleDot"} size={10} fill="currentColor" />
+            <Circle className={active?.alive ? "liveDot" : "idleDot"} size={10} fill="currentColor" />
             <span>{active ? active.name : "No active terminal"}</span>
           </div>
           <div className="topbarActions">
@@ -319,11 +541,15 @@ function App() {
           </div>
         </header>
 
-        {error && <div className="errorBanner">{error}</div>}
+        {error && (
+          <DismissibleMessage className="errorBanner" onClose={() => setError(null)}>
+            {error}
+          </DismissibleMessage>
+        )}
 
         {active ? (
           <TerminalPane
-            key={active.id}
+            key={`${active.id}:${active.created_at}`}
             session={active}
             resizeToken={resizeToken}
             onResized={updateSession}
@@ -403,7 +629,11 @@ function ConfirmDeleteDialog({
           This will terminate <strong>{session.name}</strong> and close its current PTY.
         </p>
         <div className="confirmMeta">{session.command}</div>
-        {formError && <div className="formError">{formError}</div>}
+        {formError && (
+          <DismissibleMessage className="formError" onClose={() => setFormError(null)}>
+            {formError}
+          </DismissibleMessage>
+        )}
 
         <div className="dialogActions">
           <button type="button" className="secondaryButton" onClick={onCancel} disabled={submitting}>
@@ -414,6 +644,25 @@ function ConfirmDeleteDialog({
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+function DismissibleMessage({
+  className,
+  children,
+  onClose,
+}: {
+  className: string;
+  children: React.ReactNode;
+  onClose: () => void;
+}) {
+  return (
+    <div className={className}>
+      <span>{children}</span>
+      <button type="button" className="messageClose" title="Close message" onClick={onClose}>
+        <X size={14} />
+      </button>
     </div>
   );
 }
@@ -430,29 +679,103 @@ function TerminalPane({
   onError: (message: string) => void;
 }) {
   const containerRef = React.useRef<HTMLDivElement | null>(null);
+  const desktopGridRef = React.useRef<HTMLDivElement | null>(null);
   const termRef = React.useRef<Terminal | null>(null);
   const wsRef = React.useRef<WebSocket | null>(null);
   const inputEnabledRef = React.useRef(true);
   const lastModeRef = React.useRef<InteractionMode>("input");
+  const viewportRefreshTimerRef = React.useRef<number | null>(null);
+  const wsReconnectTimerRef = React.useRef<number | null>(null);
+  const focusedPaneRef = React.useRef<string | null>(null);
+  const transferIdsRef = React.useRef(new Set<string>());
   const encoderRef = React.useRef(new TextEncoder());
   const [connected, setConnected] = useState(false);
   const [interactionMode, setInteractionMode] = useState<InteractionMode>("input");
   const [tmuxState, setTmuxState] = useState<TmuxState | null>(null);
-  const [focusedPane, setFocusedPane] = useState<string | null>(null);
+  const [focusedPane, setFocusedPaneState] = useState<string | null>(() =>
+    readStoredValue(focusedPaneStorageKey(session.id)),
+  );
   const [toolsOpen, setToolsOpen] = useState(false);
-  const [annotations, setAnnotations] = useState<TmuxAnnotations>(() => loadAnnotations(session.command));
+  const [fileNotice, setFileNotice] = useState<string | null>(null);
   const controlMode = session.mode === "local_cc" || session.mode === "ssh_cc";
   const activePane = findActivePane(tmuxState, focusedPane);
   const activeWindow = findWindowForPane(tmuxState, activePane?.id ?? null);
+  const visibleWindow = activeWindow ?? tmuxState?.windows[0] ?? null;
+  const desktopSplitEnabled = controlMode && visibleWindow !== null && visibleWindow.panes.length > 1;
   const activeContext =
     activeWindow && activePane
-      ? `${windowLabel(activeWindow, annotations)} / ${paneLabel(activePane, annotations)}`
+      ? `${windowLabel(activeWindow)} / ${paneLabel(activePane)}`
       : session.name;
 
+  const rememberFocusedPane = useCallback(
+    (paneId: string | null) => {
+      setFocusedPaneState(paneId);
+      focusedPaneRef.current = paneId;
+      writeStoredValue(focusedPaneStorageKey(session.id), paneId);
+    },
+    [session.id],
+  );
+
+  const resizeTerminalToContainer = useCallback(
+    () => {
+      const term = termRef.current;
+      const container = containerRef.current;
+      if (!term || !container) return;
+
+      const nextSize =
+        desktopSplitEnabled && desktopGridRef.current
+          ? measureDesktopGrid(desktopGridRef.current, term)
+          : measureTerminalGrid(container, term);
+      term.resize(nextSize.cols, nextSize.rows);
+      if (inputEnabledRef.current) {
+        scrollTerminalToBottomSoon(term);
+      }
+
+      void api
+        .resizeSession(session.id, nextSize)
+        .then(onResized)
+        .catch((err: unknown) => {
+          onError(err instanceof Error ? err.message : String(err));
+        });
+    },
+    [desktopSplitEnabled, session.id, onResized, onError],
+  );
+
+  const scheduleLocalViewportRefresh = useCallback((delay = 120) => {
+    if (viewportRefreshTimerRef.current !== null) {
+      window.clearTimeout(viewportRefreshTimerRef.current);
+    }
+    viewportRefreshTimerRef.current = window.setTimeout(() => {
+      const term = termRef.current;
+      viewportRefreshTimerRef.current = null;
+      if (!term) return;
+      term.resize(term.cols, term.rows);
+      if (inputEnabledRef.current) {
+        scrollTerminalToBottomSoon(term);
+      }
+    }, delay);
+  }, []);
+
   useEffect(() => {
-    setAnnotations(loadAnnotations(session.command));
+    return () => {
+      if (viewportRefreshTimerRef.current !== null) {
+        window.clearTimeout(viewportRefreshTimerRef.current);
+        viewportRefreshTimerRef.current = null;
+      }
+      if (wsReconnectTimerRef.current !== null) {
+        window.clearTimeout(wsReconnectTimerRef.current);
+        wsReconnectTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    focusedPaneRef.current = focusedPane;
+  }, [focusedPane]);
+
+  useEffect(() => {
     setToolsOpen(false);
-  }, [session.id, session.command]);
+  }, [session.id]);
 
   useEffect(() => {
     const term = new Terminal({
@@ -464,7 +787,7 @@ function TerminalPane({
         "SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, Liberation Mono, monospace",
       fontSize: window.innerWidth < 720 ? 12 : 14,
       lineHeight: 1.15,
-      scrollback: 5000,
+      scrollback: 50000,
       theme: {
         background: "#101315",
         foreground: "#d7e0e5",
@@ -489,46 +812,191 @@ function TerminalPane({
       },
     });
     term.loadAddon(new WebLinksAddon());
+    attachTerminalKeyHandlers(term, (data) => {
+      const ws = wsRef.current;
+      if (inputEnabledRef.current && ws?.readyState === WebSocket.OPEN) {
+        ws.send(encoderRef.current.encode(data));
+      }
+    });
     termRef.current = term;
 
     if (!containerRef.current) return;
     term.open(containerRef.current);
+    const detachPasteHandler = attachPasteHandler(containerRef.current, (data) => {
+      const ws = wsRef.current;
+      if (inputEnabledRef.current && ws?.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "paste", data, pane_id: focusedPaneRef.current }));
+      }
+    });
+    scheduleLocalViewportRefresh(0);
 
-    const proto = window.location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${window.location.host}/ws/sessions/${session.id}`);
-    ws.binaryType = "arraybuffer";
-    wsRef.current = ws;
+    let disposed = false;
+    let reconnectAttempt = 0;
 
-    ws.onopen = () => {
-      setConnected(true);
-      term.focus();
-    };
-    ws.onclose = () => setConnected(false);
-    ws.onerror = () => setConnected(false);
-    ws.onmessage = (event) => {
-      if (event.data instanceof ArrayBuffer) {
-        term.write(new Uint8Array(event.data));
-      } else if (event.data instanceof Blob) {
-        void event.data.arrayBuffer().then((buffer) => term.write(new Uint8Array(buffer)));
-      } else {
-        handleServerTextMessage(String(event.data), term, setTmuxState, setFocusedPane);
+    const clearReconnectTimer = () => {
+      if (wsReconnectTimerRef.current !== null) {
+        window.clearTimeout(wsReconnectTimerRef.current);
+        wsReconnectTimerRef.current = null;
       }
     };
 
+    const scheduleReconnect = () => {
+      if (disposed || document.hidden) return;
+      clearReconnectTimer();
+      const delay = Math.min(1000 * 2 ** reconnectAttempt, 10000);
+      reconnectAttempt += 1;
+      wsReconnectTimerRef.current = window.setTimeout(() => {
+        wsReconnectTimerRef.current = null;
+        connectWebSocket();
+      }, delay);
+    };
+
+    const connectWebSocket = () => {
+      if (disposed) return;
+      const current = wsRef.current;
+      if (
+        current &&
+        (current.readyState === WebSocket.OPEN || current.readyState === WebSocket.CONNECTING)
+      ) {
+        return;
+      }
+
+      const proto = window.location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(`${proto}://${window.location.host}/ws/sessions/${session.id}`);
+      ws.binaryType = "arraybuffer";
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        if (disposed || wsRef.current !== ws) return;
+        reconnectAttempt = 0;
+        setConnected(true);
+        term.clear();
+        term.focus();
+        if (inputEnabledRef.current) {
+          scrollTerminalToBottomSoon(term);
+        }
+        const paneId = focusedPaneRef.current;
+        if (paneId) {
+          ws.send(JSON.stringify({ type: "focus_pane", pane_id: paneId }));
+        }
+      };
+      ws.onclose = () => {
+        if (wsRef.current === ws) {
+          wsRef.current = null;
+        }
+        setConnected(false);
+        scheduleReconnect();
+      };
+      ws.onerror = () => {
+        setConnected(false);
+      };
+      ws.onmessage = (event) => {
+        if (disposed || wsRef.current !== ws) return;
+        if (event.data instanceof ArrayBuffer) {
+          term.write(new Uint8Array(event.data));
+          if (inputEnabledRef.current) {
+            scrollTerminalToBottomSoon(term);
+          }
+        } else if (event.data instanceof Blob) {
+          void event.data.arrayBuffer().then((buffer) => {
+            if (!disposed && wsRef.current === ws) {
+              term.write(new Uint8Array(buffer));
+              if (inputEnabledRef.current) {
+                scrollTerminalToBottomSoon(term);
+              }
+            }
+          });
+        } else {
+          const terminalChanged = handleServerTextMessage(
+            String(event.data),
+            term,
+            setTmuxState,
+            rememberFocusedPane,
+            (message) => {
+              if (!transferIdsRef.current.has(message.id)) return;
+              transferIdsRef.current.delete(message.id);
+              const filename = decodeBase64Text(message.filename_base64);
+              triggerBrowserDownload(filename, message.data_base64);
+              setFileNotice(`Downloaded ${filename}`);
+            },
+            (message) => {
+              if (!transferIdsRef.current.has(message.id)) return;
+              if (message.status === "error") {
+                transferIdsRef.current.delete(message.id);
+              }
+              setFileNotice(message.message);
+            },
+          );
+          if (terminalChanged && inputEnabledRef.current) {
+            scrollTerminalToBottomSoon(term);
+          }
+        }
+      };
+    };
+
+    const restoreInputViewport = () => {
+      if (document.hidden) return;
+      if (inputEnabledRef.current) {
+        scrollTerminalToBottomSoon(term);
+      }
+    };
+
+    const reconnectWhenVisible = () => {
+      restoreInputViewport();
+      const ws = wsRef.current;
+      if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+        reconnectAttempt = 0;
+        clearReconnectTimer();
+        connectWebSocket();
+      }
+    };
+
+    connectWebSocket();
+    document.addEventListener("visibilitychange", reconnectWhenVisible);
+    window.addEventListener("focus", restoreInputViewport);
+    window.addEventListener("online", reconnectWhenVisible);
+
     const dataSub = term.onData((data) => {
-      if (inputEnabledRef.current && ws.readyState === WebSocket.OPEN) {
+      const ws = wsRef.current;
+      if (inputEnabledRef.current && ws?.readyState === WebSocket.OPEN) {
         ws.send(encoderRef.current.encode(data));
       }
     });
 
     return () => {
+      disposed = true;
+      document.removeEventListener("visibilitychange", reconnectWhenVisible);
+      window.removeEventListener("focus", restoreInputViewport);
+      window.removeEventListener("online", reconnectWhenVisible);
+      clearReconnectTimer();
+      if (viewportRefreshTimerRef.current !== null) {
+        window.clearTimeout(viewportRefreshTimerRef.current);
+        viewportRefreshTimerRef.current = null;
+      }
       dataSub.dispose();
-      ws.close();
+      detachPasteHandler();
+      wsRef.current?.close();
       term.dispose();
       termRef.current = null;
       wsRef.current = null;
     };
-  }, [session.id]);
+  }, [session.id, scheduleLocalViewportRefresh, rememberFocusedPane]);
+
+  useEffect(() => {
+    if (!tmuxState) return;
+    const panes = tmuxState.windows.flatMap((window) => window.panes);
+    if (focusedPane && panes.some((pane) => pane.id === focusedPane)) return;
+
+    const storedPane = readStoredValue(focusedPaneStorageKey(session.id));
+    const nextPane =
+      (storedPane && panes.find((pane) => pane.id === storedPane)?.id) ??
+      tmuxState.active_pane ??
+      panes[0]?.id ??
+      null;
+    if (nextPane) {
+      rememberFocusedPane(nextPane);
+    }
+  }, [focusedPane, rememberFocusedPane, session.id, tmuxState]);
 
   useEffect(() => {
     inputEnabledRef.current = interactionMode === "input";
@@ -541,7 +1009,7 @@ function TerminalPane({
       if (!controlMode && lastModeRef.current === "browse" && ws?.readyState === WebSocket.OPEN) {
         ws.send("\x1b");
       }
-      term.scrollToBottom();
+      scrollTerminalToBottomSoon(term);
       term.focus();
     } else {
       if (!controlMode && lastModeRef.current === "input" && ws?.readyState === WebSocket.OPEN) {
@@ -553,17 +1021,17 @@ function TerminalPane({
   }, [controlMode, interactionMode]);
 
   useEffect(() => {
-    if (controlMode || interactionMode !== "browse") return;
-
     const container = containerRef.current;
-    const viewport = container?.querySelector<HTMLElement>(".xterm-viewport");
-    if (!container || !viewport) return;
+    const term = termRef.current;
+    if (!container || !term) return;
 
     let lastTouchY: number | null = null;
+    let scrollRemainder = 0;
     let wheelRemainder = 0;
     const lineThreshold = 12;
 
     const sendTmuxScroll = (deltaY: number) => {
+      if (controlMode || interactionMode !== "browse") return;
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
@@ -577,7 +1045,12 @@ function TerminalPane({
     };
 
     const scrollHistory = (deltaY: number) => {
-      viewport.scrollTop += deltaY;
+      scrollRemainder += deltaY;
+      const lines = Math.trunc(scrollRemainder / lineThreshold);
+      if (lines !== 0) {
+        scrollRemainder -= lines * lineThreshold;
+        term.scrollLines(lines);
+      }
       sendTmuxScroll(deltaY);
     };
 
@@ -618,23 +1091,30 @@ function TerminalPane({
   }, [controlMode, interactionMode]);
 
   useEffect(() => {
+    const refreshTerminalViewport = () => scheduleLocalViewportRefresh();
+
+    const viewport = window.visualViewport;
+    viewport?.addEventListener("resize", refreshTerminalViewport);
+    viewport?.addEventListener("scroll", refreshTerminalViewport);
+    window.addEventListener("resize", refreshTerminalViewport);
+    window.addEventListener("orientationchange", refreshTerminalViewport);
+
+    return () => {
+      viewport?.removeEventListener("resize", refreshTerminalViewport);
+      viewport?.removeEventListener("scroll", refreshTerminalViewport);
+      window.removeEventListener("resize", refreshTerminalViewport);
+      window.removeEventListener("orientationchange", refreshTerminalViewport);
+      if (viewportRefreshTimerRef.current !== null) {
+        window.clearTimeout(viewportRefreshTimerRef.current);
+        viewportRefreshTimerRef.current = null;
+      }
+    };
+  }, [scheduleLocalViewportRefresh]);
+
+  useEffect(() => {
     if (resizeToken === 0) return;
-
-    const term = termRef.current;
-    const container = containerRef.current;
-    if (!term || !container) return;
-
-    const nextSize = measureTerminalGrid(container, term);
-    term.resize(nextSize.cols, nextSize.rows);
-    term.scrollToBottom();
-
-    void api
-      .resizeSession(session.id, nextSize)
-      .then(onResized)
-      .catch((err: unknown) => {
-        onError(err instanceof Error ? err.message : String(err));
-      });
-  }, [resizeToken, session.id, onResized, onError]);
+    resizeTerminalToContainer();
+  }, [resizeToken, resizeTerminalToContainer]);
 
   const send = (value: string) => {
     if (interactionMode !== "input") return;
@@ -646,7 +1126,7 @@ function TerminalPane({
     const ws = wsRef.current;
     if (ws?.readyState !== WebSocket.OPEN) return;
     setInteractionMode("input");
-    setFocusedPane(paneId);
+    rememberFocusedPane(paneId);
     termRef.current?.clear();
     ws.send(JSON.stringify({ type: "focus_pane", pane_id: paneId }));
   };
@@ -654,33 +1134,107 @@ function TerminalPane({
   const sendTmuxCommand = (command: TmuxCommand) => {
     const ws = wsRef.current;
     if (ws?.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type: "tmux_command", command }));
+    ws.send(JSON.stringify({ type: "tmux_command", command, pane_id: activePane?.id ?? null }));
   };
 
-  const annotateTarget = (target: "window" | "pane", id: string, current: string) => {
-    const next = window.prompt("Note", current);
+  const resizePane = (paneId: string, direction: ResizeDirection, amount: number) => {
+    const ws = wsRef.current;
+    if (ws?.readyState !== WebSocket.OPEN) return;
+    ws.send(
+      JSON.stringify({
+        type: "resize_pane",
+        pane_id: paneId,
+        direction,
+        amount: clamp(Math.round(amount), 1, 80),
+      }),
+    );
+  };
+
+  const renameWindow = (windowId: string, current: string) => {
+    const ws = wsRef.current;
+    if (ws?.readyState !== WebSocket.OPEN) return;
+    const next = window.prompt("Tab name", current);
     if (next === null) return;
-    setAnnotations((currentAnnotations) => {
-      const trimmed = next.trim();
-      const updated: TmuxAnnotations = {
-        windows: { ...currentAnnotations.windows },
-        panes: { ...currentAnnotations.panes },
-      };
-      const bucket = target === "window" ? updated.windows : updated.panes;
-      if (trimmed) {
-        bucket[id] = trimmed;
-      } else {
-        delete bucket[id];
-      }
-      saveAnnotations(session.command, updated);
-      return updated;
-    });
+    const name = next.trim();
+    if (!name || name === current) return;
+    ws.send(JSON.stringify({ type: "rename_window", window_id: windowId, name }));
+  };
+
+  const setPaneNote = (paneId: string, current: string) => {
+    const ws = wsRef.current;
+    if (ws?.readyState !== WebSocket.OPEN) return;
+    const next = window.prompt("Pane note", current);
+    if (next === null) return;
+    ws.send(JSON.stringify({ type: "set_pane_note", pane_id: paneId, note: next.trim() }));
   };
 
   const copySelection = async () => {
     const selection = termRef.current?.getSelection() ?? "";
     if (!selection) return;
     await navigator.clipboard.writeText(selection);
+  };
+
+  const downloadRemoteFile = () => {
+    const ws = wsRef.current;
+    if (ws?.readyState !== WebSocket.OPEN) return;
+    const path = window.prompt("Remote file path to download", "");
+    if (!path?.trim()) return;
+    const id = makeTransferId();
+    transferIdsRef.current.add(id);
+    setFileNotice(`Downloading ${path.trim()}...`);
+    ws.send(
+      JSON.stringify({
+        type: "file_download",
+        id,
+        path: path.trim(),
+        pane_id: focusedPaneRef.current,
+      }),
+    );
+  };
+
+  const uploadRemoteFile = async () => {
+    const ws = wsRef.current;
+    if (ws?.readyState !== WebSocket.OPEN) return;
+    const file = await chooseLocalFile();
+    if (!file) return;
+    if (file.size > MAX_UPLOAD_BYTES) {
+      setFileNotice(`Upload is limited to ${Math.floor(MAX_UPLOAD_BYTES / 1024 / 1024)} MB in this version`);
+      return;
+    }
+
+    const defaultPath = `./${file.name}`;
+    const path = window.prompt("Remote destination path", defaultPath);
+    if (!path?.trim()) return;
+
+    const id = makeTransferId();
+    const paneId = focusedPaneRef.current;
+    transferIdsRef.current.add(id);
+    setFileNotice(`Uploading ${file.name}...`);
+
+    try {
+      const base64 = await readFileAsBase64(file);
+      ws.send(JSON.stringify({ type: "file_upload_start", id, path: path.trim(), pane_id: paneId }));
+      for (let offset = 0; offset < base64.length; offset += FILE_UPLOAD_CHUNK_CHARS) {
+        if (ws.readyState !== WebSocket.OPEN) throw new Error("terminal connection closed");
+        ws.send(
+          JSON.stringify({
+            type: "file_upload_chunk",
+            id,
+            data: base64.slice(offset, offset + FILE_UPLOAD_CHUNK_CHARS),
+          }),
+        );
+        await waitForSocketBuffer(ws);
+      }
+      ws.send(JSON.stringify({ type: "file_upload_finish", id }));
+      setFileNotice(`Upload sent: ${path.trim()}`);
+      window.setTimeout(() => transferIdsRef.current.delete(id), 30_000);
+    } catch (err) {
+      transferIdsRef.current.delete(id);
+      setFileNotice(err instanceof Error ? err.message : String(err));
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "file_transfer_cancel", id }));
+      }
+    }
   };
 
   return (
@@ -706,26 +1260,49 @@ function TerminalPane({
             <Copy size={14} />
             Copy
           </button>
+          <button className="chromeButton" type="button" onClick={downloadRemoteFile}>
+            <Download size={14} />
+            Download
+          </button>
+          <button className="chromeButton" type="button" onClick={() => void uploadRemoteFile()}>
+            <Upload size={14} />
+            Upload
+          </button>
           <span className="terminalCommand">{session.command}</span>
         </div>
+      )}
+      {fileNotice && (
+        <DismissibleMessage className="fileNotice" onClose={() => setFileNotice(null)}>
+          {fileNotice}
+        </DismissibleMessage>
       )}
       {controlMode && tmuxState && toolsOpen && (
         <TmuxNavigator
           state={tmuxState}
           focusedPane={focusedPane}
-          annotations={annotations}
           onFocusPane={focusPane}
           onCommand={sendTmuxCommand}
-          onAnnotate={annotateTarget}
+          onRenameWindow={renameWindow}
+          onSetPaneNote={setPaneNote}
         />
       )}
       <div
         ref={containerRef}
-        className={`terminalSurface ${interactionMode === "browse" ? "browseMode" : "inputMode"}`}
+        className={`terminalSurface ${interactionMode === "browse" ? "browseMode" : "inputMode"} ${desktopSplitEnabled ? "desktopSplitHidden" : ""}`}
       />
+      {desktopSplitEnabled && visibleWindow && (
+        <DesktopPaneGrid
+          ref={desktopGridRef}
+          sessionId={session.id}
+          window={visibleWindow}
+          focusedPane={focusedPane}
+          interactionMode={interactionMode}
+          onFocusPane={focusPane}
+          onResizePane={resizePane}
+        />
+      )}
       <MobileKeybar
         mode={interactionMode}
-        onModeChange={setInteractionMode}
         onCopy={() => void copySelection()}
         onSend={send}
       />
@@ -752,27 +1329,77 @@ function measureTerminalGrid(container: HTMLElement, term: Terminal): ResizeSess
   };
 }
 
+function measureDesktopGrid(grid: HTMLElement, fallbackTerm: Terminal): ResizeSessionPayload {
+  const styles = window.getComputedStyle(grid);
+  const parent = grid.parentElement;
+  const availableWidth = parent?.clientWidth ?? grid.clientWidth;
+  const availableHeight = parent
+    ? Math.max(parent.clientHeight - grid.offsetTop, 0)
+    : grid.clientHeight;
+  const width = availableWidth - parseFloat(styles.paddingLeft) - parseFloat(styles.paddingRight);
+  const height = availableHeight - parseFloat(styles.paddingTop) - parseFloat(styles.paddingBottom);
+  const surfaces = Array.from(
+    grid.querySelectorAll<HTMLElement>(".desktopPaneSurface[data-cols][data-rows]"),
+  );
+  const surface = surfaces[0];
+  const screen = surface?.querySelector<HTMLElement>(".xterm-screen");
+  const rect = screen?.getBoundingClientRect();
+  const cols = Number(surface?.dataset.cols ?? 0);
+  const rows = Number(surface?.dataset.rows ?? 0);
+  const cellWidth =
+    rect && rect.width > 0 && cols > 0
+      ? rect.width / cols
+      : getFallbackCellWidth(fallbackTerm);
+  const cellHeight =
+    rect && rect.height > 0 && rows > 0
+      ? rect.height / rows
+      : getFallbackCellHeight(fallbackTerm);
+  const verticalBoundaries = new Set(
+    surfaces
+      .map((item) => Number(item.dataset.paneLeft ?? 0))
+      .filter((left) => Number.isFinite(left) && left > 0),
+  );
+  const reservedWidth =
+    verticalBoundaries.size * DESKTOP_PANE_SEPARATOR_GAP_PX +
+    DESKTOP_PANE_EDGE_GUARD_PX +
+    2;
+  const safetyRows = surfaces.length > 1 ? 1 : 0;
+
+  return {
+    cols: clamp(Math.floor((width - reservedWidth) / cellWidth), 40, 240),
+    rows: clamp(Math.floor(height / cellHeight) - safetyRows, 12, 80),
+  };
+}
+
 function handleServerTextMessage(
   data: string,
   term: Terminal,
   setTmuxState: React.Dispatch<React.SetStateAction<TmuxState | null>>,
-  setFocusedPane: React.Dispatch<React.SetStateAction<string | null>>,
-) {
+  setFocusedPane: (paneId: string) => void,
+  onFileDownload: (message: Extract<ServerMessage, { type: "file_download" }>) => void,
+  onFileTransferStatus: (message: Extract<ServerMessage, { type: "file_transfer_status" }>) => void,
+): boolean {
   let message: ServerMessage;
   try {
     message = JSON.parse(data) as ServerMessage;
   } catch {
     term.write(data);
-    return;
+    return true;
   }
 
   if (message.type === "clear") {
     term.clear();
+    return true;
   } else if (message.type === "focus_pane") {
     setFocusedPane(message.pane_id);
   } else if (message.type === "tmux_state") {
     setTmuxState(message.state);
+  } else if (message.type === "file_download") {
+    onFileDownload(message);
+  } else if (message.type === "file_transfer_status") {
+    onFileTransferStatus(message);
   }
+  return false;
 }
 
 function findActivePane(state: TmuxState | null, focusedPane: string | null): TmuxPane | null {
@@ -790,28 +1417,461 @@ function findWindowForPane(state: TmuxState | null, paneId: string | null): Tmux
   return state.windows.find((window) => window.panes.some((pane) => pane.id === paneId)) ?? null;
 }
 
-function windowLabel(window: TmuxWindow, annotations: TmuxAnnotations): string {
-  return annotations.windows[window.id] || `${window.index ?? "-"} ${window.name || window.id}`;
+function windowLabel(window: TmuxWindow): string {
+  return `${window.index ?? "-"} ${window.name || window.id}`;
 }
 
-function paneLabel(pane: TmuxPane, annotations: TmuxAnnotations): string {
-  return annotations.panes[pane.id] || `${pane.id} ${pane.current_command || "shell"}`;
+function paneLabel(pane: TmuxPane): string {
+  return pane.note || `${pane.id} ${pane.current_command || "shell"}`;
+}
+
+const DesktopPaneGrid = React.forwardRef<HTMLDivElement, {
+  sessionId: string;
+  window: TmuxWindow;
+  focusedPane: string | null;
+  interactionMode: InteractionMode;
+  onFocusPane: (paneId: string) => void;
+  onResizePane: (paneId: string, direction: ResizeDirection, amount: number) => void;
+}>(function DesktopPaneGrid({
+  sessionId,
+  window,
+  focusedPane,
+  interactionMode,
+  onFocusPane,
+  onResizePane,
+}, ref) {
+  const [cellSize, setCellSize] = useState<{ width: number; height: number } | null>(null);
+  const hasGeometry = window.panes.every(
+    (pane) => pane.left !== null && pane.top !== null && pane.width !== null && pane.height !== null,
+  );
+  const maxRight = Math.max(
+    ...window.panes.map((pane) => (pane.left ?? 0) + (pane.width ?? 1)),
+    1,
+  );
+  const maxBottom = Math.max(
+    ...window.panes.map((pane) => (pane.top ?? 0) + (pane.height ?? 1)),
+    1,
+  );
+  const verticalBoundaries = Array.from(
+    new Set(
+      window.panes
+        .map((pane) => pane.left)
+        .filter((left): left is number => left != null && left > 0),
+    ),
+  ).sort((a, b) => a - b);
+  const rememberCellSize = useCallback((width: number, height: number) => {
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return;
+    setCellSize((current) => {
+      if (
+        current &&
+        Math.abs(current.width - width) < 0.05 &&
+        Math.abs(current.height - height) < 0.05
+      ) {
+        return current;
+      }
+      return { width, height };
+    });
+  }, []);
+  const pixelGeometry = hasGeometry && cellSize !== null;
+  const gridStyle: React.CSSProperties | undefined = pixelGeometry
+    ? {
+        width: `${
+          Math.ceil(maxRight * cellSize.width) +
+          verticalBoundaries.length * DESKTOP_PANE_SEPARATOR_GAP_PX +
+          DESKTOP_PANE_EDGE_GUARD_PX +
+          2
+        }px`,
+        height: `${Math.ceil(maxBottom * cellSize.height) + 2}px`,
+      }
+    : undefined;
+
+  return (
+    <div
+      ref={ref}
+      className={`desktopPaneGrid ${hasGeometry ? "geometry" : "fallback"} ${pixelGeometry ? "pixelGeometry" : ""}`}
+      style={gridStyle}
+    >
+      {window.panes.map((pane) => {
+        const left = pane.left ?? 0;
+        const top = pane.top ?? 0;
+        const width = pane.width ?? maxRight;
+        const height = pane.height ?? maxBottom;
+        const boundariesBefore = verticalBoundaries.filter((boundary) => boundary <= left).length;
+        const style: React.CSSProperties = hasGeometry
+          ? pixelGeometry
+            ? {
+                left: `${Math.round(left * cellSize.width) + boundariesBefore * DESKTOP_PANE_SEPARATOR_GAP_PX}px`,
+                top: `${Math.round(top * cellSize.height)}px`,
+                width: `${Math.ceil(width * cellSize.width) + DESKTOP_PANE_EDGE_GUARD_PX + 2}px`,
+                height: `${Math.ceil(height * cellSize.height) + 2}px`,
+              }
+            : {
+                left: `${(left / maxRight) * 100}%`,
+                top: `${(top / maxBottom) * 100}%`,
+                width: `${(width / maxRight) * 100}%`,
+                height: `${(height / maxBottom) * 100}%`,
+              }
+          : {};
+
+        return (
+          <PaneTerminal
+            key={pane.id}
+            sessionId={sessionId}
+            pane={pane}
+            selected={pane.id === focusedPane}
+            interactionMode={interactionMode}
+            style={style}
+            onFocus={() => onFocusPane(pane.id)}
+            onResizePane={onResizePane}
+            onCellSize={rememberCellSize}
+          />
+        );
+      })}
+    </div>
+  );
+});
+
+function PaneTerminal({
+  sessionId,
+  pane,
+  selected,
+  interactionMode,
+  style,
+  onFocus,
+  onResizePane,
+  onCellSize,
+}: {
+  sessionId: string;
+  pane: TmuxPane;
+  selected: boolean;
+  interactionMode: InteractionMode;
+  style: React.CSSProperties;
+  onFocus: () => void;
+  onResizePane: (paneId: string, direction: ResizeDirection, amount: number) => void;
+  onCellSize: (width: number, height: number) => void;
+}) {
+  const containerRef = React.useRef<HTMLDivElement | null>(null);
+  const termRef = React.useRef<Terminal | null>(null);
+  const wsRef = React.useRef<WebSocket | null>(null);
+  const reconnectTimerRef = React.useRef<number | null>(null);
+  const encoderRef = React.useRef(new TextEncoder());
+  const dragRef = React.useRef<{
+    x: number;
+    y: number;
+    axis: "x" | "y";
+    pointerId: number;
+  } | null>(null);
+
+  useEffect(() => {
+    const term = new Terminal({
+      cols: pane.width ?? 80,
+      rows: pane.height ?? 24,
+      cursorBlink: true,
+      convertEol: false,
+      fontFamily:
+        "SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, Liberation Mono, monospace",
+      fontSize: 13,
+      lineHeight: 1.15,
+      scrollback: 50000,
+      theme: {
+        background: "#101315",
+        foreground: "#d7e0e5",
+        cursor: "#f3c969",
+        selectionBackground: "#31515f",
+      },
+    });
+    term.loadAddon(new WebLinksAddon());
+    attachTerminalKeyHandlers(term, (data) => {
+      const ws = wsRef.current;
+      if (interactionMode === "input" && ws?.readyState === WebSocket.OPEN) {
+        ws.send(encoderRef.current.encode(data));
+      }
+    });
+    termRef.current = term;
+
+    if (!containerRef.current) return;
+    term.open(containerRef.current);
+    const detachPasteHandler = attachPasteHandler(containerRef.current, (data) => {
+      const ws = wsRef.current;
+      if (interactionMode === "input" && ws?.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "paste", data, pane_id: pane.id }));
+      }
+    });
+
+    let disposed = false;
+    let reconnectAttempt = 0;
+
+    const resizeToPane = () => {
+      const container = containerRef.current;
+      if (!container) return;
+      const cols = clamp(pane.width ?? 80, 1, 240);
+      const rows = clamp(pane.height ?? 24, 1, 80);
+      term.resize(cols, rows);
+      container.dataset.cols = String(cols);
+      container.dataset.rows = String(rows);
+      container.dataset.paneLeft = String(pane.left ?? 0);
+      container.dataset.paneTop = String(pane.top ?? 0);
+      const screen = container.querySelector<HTMLElement>(".xterm-screen");
+      const rect = screen?.getBoundingClientRect();
+      if (rect && rect.width > 0 && rect.height > 0) {
+        container.dataset.cellWidth = String(rect.width / cols);
+        container.dataset.cellHeight = String(rect.height / rows);
+        onCellSize(rect.width / cols, rect.height / rows);
+      }
+    };
+
+    window.setTimeout(resizeToPane, 0);
+    window.setTimeout(resizeToPane, 120);
+
+    const clearReconnectTimer = () => {
+      if (reconnectTimerRef.current !== null) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+    };
+
+    const connect = () => {
+      if (disposed) return;
+      const current = wsRef.current;
+      if (
+        current &&
+        (current.readyState === WebSocket.OPEN || current.readyState === WebSocket.CONNECTING)
+      ) {
+        return;
+      }
+
+      const proto = window.location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(
+        `${proto}://${window.location.host}/ws/sessions/${sessionId}?pane_view=true`,
+      );
+      ws.binaryType = "arraybuffer";
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        if (disposed || wsRef.current !== ws) return;
+        reconnectAttempt = 0;
+        term.clear();
+        ws.send(JSON.stringify({ type: "focus_pane", pane_id: pane.id }));
+        if (interactionMode === "input") {
+          scrollTerminalToBottomSoon(term);
+        }
+      };
+      ws.onclose = () => {
+        if (wsRef.current === ws) wsRef.current = null;
+        if (disposed || document.hidden) return;
+        clearReconnectTimer();
+        const delay = Math.min(1000 * 2 ** reconnectAttempt, 10000);
+        reconnectAttempt += 1;
+        reconnectTimerRef.current = window.setTimeout(connect, delay);
+      };
+      ws.onmessage = (event) => {
+        if (disposed || wsRef.current !== ws) return;
+        if (event.data instanceof ArrayBuffer) {
+          term.write(new Uint8Array(event.data));
+          if (interactionMode === "input") {
+            scrollTerminalToBottomSoon(term);
+          }
+        } else if (event.data instanceof Blob) {
+          void event.data.arrayBuffer().then((buffer) => {
+            if (!disposed && wsRef.current === ws) {
+              term.write(new Uint8Array(buffer));
+              if (interactionMode === "input") {
+                scrollTerminalToBottomSoon(term);
+              }
+            }
+          });
+        } else {
+          const terminalChanged = handlePaneTerminalTextMessage(String(event.data), term);
+          if (terminalChanged && interactionMode === "input") {
+            scrollTerminalToBottomSoon(term);
+          }
+        }
+      };
+    };
+
+    const restoreInputViewport = () => {
+      if (document.hidden) return;
+      if (interactionMode === "input") {
+        scrollTerminalToBottomSoon(term);
+      }
+    };
+
+    const reconnectWhenVisible = () => {
+      restoreInputViewport();
+      if (!wsRef.current || wsRef.current.readyState >= WebSocket.CLOSING) {
+        reconnectAttempt = 0;
+        clearReconnectTimer();
+        connect();
+      }
+    };
+
+    connect();
+    document.addEventListener("visibilitychange", reconnectWhenVisible);
+    window.addEventListener("focus", restoreInputViewport);
+    window.addEventListener("online", reconnectWhenVisible);
+
+    const dataSub = term.onData((data) => {
+      const ws = wsRef.current;
+      if (interactionMode === "input" && ws?.readyState === WebSocket.OPEN) {
+        ws.send(encoderRef.current.encode(data));
+      }
+    });
+
+    return () => {
+      disposed = true;
+      document.removeEventListener("visibilitychange", reconnectWhenVisible);
+      window.removeEventListener("focus", restoreInputViewport);
+      window.removeEventListener("online", reconnectWhenVisible);
+      clearReconnectTimer();
+      dataSub.dispose();
+      detachPasteHandler();
+      wsRef.current?.close();
+      term.dispose();
+      termRef.current = null;
+      wsRef.current = null;
+    };
+  }, [interactionMode, onCellSize, pane.height, pane.id, pane.width, sessionId]);
+
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+    term.options.disableStdin = interactionMode === "browse";
+    if (selected && interactionMode === "input") {
+      term.focus();
+      scrollTerminalToBottomSoon(term);
+    }
+  }, [interactionMode, selected]);
+
+  const startResizeDrag = (
+    event: React.PointerEvent<HTMLButtonElement>,
+    axis: "x" | "y",
+  ) => {
+    if (interactionMode !== "input") return;
+    event.preventDefault();
+    event.stopPropagation();
+    onFocus();
+    dragRef.current = {
+      x: event.clientX,
+      y: event.clientY,
+      axis,
+      pointerId: event.pointerId,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const finishResizeDrag = (event: React.PointerEvent<HTMLButtonElement>) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    dragRef.current = null;
+
+    const container = containerRef.current;
+    if (!container) return;
+    const cols = Number(container.dataset.cols || pane.width || 80);
+    const rows = Number(container.dataset.rows || pane.height || 24);
+    const cellWidth =
+      Number(container.dataset.cellWidth) || container.clientWidth / Math.max(cols, 1);
+    const cellHeight =
+      Number(container.dataset.cellHeight) || container.clientHeight / Math.max(rows, 1);
+
+    if (drag.axis === "x") {
+      const delta = event.clientX - drag.x;
+      const amount = Math.abs(delta) / Math.max(cellWidth, 1);
+      if (amount >= 1) {
+        onResizePane(pane.id, delta > 0 ? "right" : "left", amount);
+      }
+    } else {
+      const delta = event.clientY - drag.y;
+      const amount = Math.abs(delta) / Math.max(cellHeight, 1);
+      if (amount >= 1) {
+        onResizePane(pane.id, delta > 0 ? "down" : "up", amount);
+      }
+    }
+  };
+
+  return (
+    <div
+      className={`desktopPane ${selected ? "selected" : ""}`}
+      style={style}
+      onMouseDown={onFocus}
+    >
+      <div className="desktopPaneLabel">{paneLabel(pane)}</div>
+      <div ref={containerRef} className="desktopPaneSurface" />
+      <button
+        type="button"
+        className="paneResizeHandle paneResizeHandleLeft"
+        aria-label="Resize pane horizontally"
+        onPointerDown={(event) => startResizeDrag(event, "x")}
+        onPointerUp={finishResizeDrag}
+        onPointerCancel={() => {
+          dragRef.current = null;
+        }}
+      />
+      <button
+        type="button"
+        className="paneResizeHandle paneResizeHandleRight"
+        aria-label="Resize pane horizontally"
+        onPointerDown={(event) => startResizeDrag(event, "x")}
+        onPointerUp={finishResizeDrag}
+        onPointerCancel={() => {
+          dragRef.current = null;
+        }}
+      />
+      <button
+        type="button"
+        className="paneResizeHandle paneResizeHandleTop"
+        aria-label="Resize pane vertically"
+        onPointerDown={(event) => startResizeDrag(event, "y")}
+        onPointerUp={finishResizeDrag}
+        onPointerCancel={() => {
+          dragRef.current = null;
+        }}
+      />
+      <button
+        type="button"
+        className="paneResizeHandle paneResizeHandleBottom"
+        aria-label="Resize pane vertically"
+        onPointerDown={(event) => startResizeDrag(event, "y")}
+        onPointerUp={finishResizeDrag}
+        onPointerCancel={() => {
+          dragRef.current = null;
+        }}
+      />
+    </div>
+  );
+}
+
+function handlePaneTerminalTextMessage(data: string, term: Terminal): boolean {
+  let message: ServerMessage;
+  try {
+    message = JSON.parse(data) as ServerMessage;
+  } catch {
+    term.write(data);
+    return true;
+  }
+
+  if (message.type === "clear") {
+    term.clear();
+    return true;
+  }
+  return false;
 }
 
 function TmuxNavigator({
   state,
   focusedPane,
-  annotations,
   onFocusPane,
   onCommand,
-  onAnnotate,
+  onRenameWindow,
+  onSetPaneNote,
 }: {
   state: TmuxState;
   focusedPane: string | null;
-  annotations: TmuxAnnotations;
   onFocusPane: (paneId: string) => void;
   onCommand: (command: TmuxCommand) => void;
-  onAnnotate: (target: "window" | "pane", id: string, current: string) => void;
+  onRenameWindow: (windowId: string, current: string) => void;
+  onSetPaneNote: (paneId: string, current: string) => void;
 }) {
   const activePane =
     state.windows.flatMap((window) => window.panes).find((pane) => pane.id === focusedPane) ??
@@ -827,13 +1887,13 @@ function TmuxNavigator({
             className={`tmuxChip ${window.panes.some((pane) => pane.id === activePane?.id) ? "selected" : ""}`}
           >
             <button type="button" onClick={() => window.panes[0] && onFocusPane(window.panes[0].id)}>
-              {windowLabel(window, annotations)}
+              {windowLabel(window)}
             </button>
             <button
               type="button"
               className="noteButton"
-              title="Edit tab note"
-              onClick={() => onAnnotate("window", window.id, annotations.windows[window.id] ?? "")}
+              title="Rename tab"
+              onClick={() => onRenameWindow(window.id, window.name)}
             >
               <Pencil size={12} />
             </button>
@@ -848,13 +1908,13 @@ function TmuxNavigator({
               className={`tmuxChip ${pane.id === activePane?.id ? "selected" : ""}`}
             >
               <button type="button" onClick={() => onFocusPane(pane.id)}>
-                {paneLabel(pane, annotations)}
+                {paneLabel(pane)}
               </button>
               <button
                 type="button"
                 className="noteButton"
                 title="Edit pane note"
-                onClick={() => onAnnotate("pane", pane.id, annotations.panes[pane.id] ?? "")}
+                onClick={() => onSetPaneNote(pane.id, pane.note ?? "")}
               >
                 <Pencil size={12} />
               </button>
@@ -920,18 +1980,17 @@ function ModeSwitch({
 
 function MobileKeybar({
   mode,
-  onModeChange,
   onCopy,
   onSend,
 }: {
   mode: InteractionMode;
-  onModeChange: (mode: InteractionMode) => void;
   onCopy: () => void;
   onSend: (value: string) => void;
 }) {
   const keys = [
     { label: "Esc", value: "\x1b" },
     { label: "Tab", value: "\t" },
+    { label: "Enter", value: "\r" },
     { label: "Ctrl-C", value: "\x03" },
     { label: "cd ..", value: "cd ..\n" },
     { label: "↑", value: "\x1b[A" },
@@ -945,19 +2004,6 @@ function MobileKeybar({
 
   return (
     <div className="mobileKeybar">
-      <Keyboard size={16} />
-      <button
-        className={mode === "input" ? "selected" : ""}
-        onClick={() => onModeChange("input")}
-      >
-        Input
-      </button>
-      <button
-        className={mode === "browse" ? "selected" : ""}
-        onClick={() => onModeChange("browse")}
-      >
-        Scroll
-      </button>
       {mode === "browse" ? (
         <button onClick={onCopy}>
           <Copy size={13} />
@@ -1102,7 +2148,11 @@ function CreateSessionDialog({
           </div>
         )}
 
-        {formError && <div className="formError">{formError}</div>}
+        {formError && (
+          <DismissibleMessage className="formError" onClose={() => setFormError(null)}>
+            {formError}
+          </DismissibleMessage>
+        )}
 
         <div className="dialogActions">
           <button type="button" className="secondaryButton" onClick={onClose} disabled={submitting}>

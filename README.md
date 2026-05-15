@@ -44,7 +44,7 @@ Run the backend from `backend/`:
 
 ```bash
 cd backend
-WEBTERMINAL_STATIC_DIR=../frontend/dist env -u SSL_CERT_FILE cargo run
+WEBTERMINAL_STATIC_DIR=../frontend/dist WEBTERMINAL_DATA_DIR=../data env -u SSL_CERT_FILE cargo run
 ```
 
 Open:
@@ -76,6 +76,39 @@ http://127.0.0.1:5173
 ```
 
 The Vite dev server proxies `/api` and `/ws` to the Rust backend.
+
+## Persistence
+
+WebTerminal stores recoverable tmux session metadata in
+`$WEBTERMINAL_DATA_DIR/sessions.json` (`../data` by default when running from
+`backend/`). Persist this directory in Docker or systemd deployments.
+
+On backend startup, saved `local`, `local_cc`, `ssh`, and `ssh_cc` sessions are
+reattached with `tmux new-session -A` or `tmux -CC new-session -A` using the
+saved tmux session name and SSH target. Deleting a session from the UI removes
+it from the store; restarting the backend does not remove the target tmux
+session.
+
+Custom one-off commands are not restored because they do not have stable tmux
+attach semantics.
+
+## Tests
+
+Run the tmux control-mode integration tests:
+
+```bash
+env -u SSL_CERT_FILE -u NODE_EXTRA_CA_CERTS npm run test:integration
+```
+
+The test starts a temporary backend on a free local port, creates real tmux
+control-mode sessions, verifies multi-browser state sync, reconnect restore,
+resize behavior, and stale pane-note cleanup after pane deletion.
+
+To test an already running backend:
+
+```bash
+WEBTERMINAL_TEST_BASE=http://127.0.0.1:8787 env -u SSL_CERT_FILE -u NODE_EXTRA_CA_CERTS npm run test:integration
+```
 
 ## Session Model
 

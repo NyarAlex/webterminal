@@ -3,6 +3,8 @@
     "dev": "npm --prefix frontend run dev",
     "build": "npm --prefix frontend run build && cargo build --manifest-path backend/Cargo.toml",
     "backend": "cargo run --manifest-path backend/Cargo.toml",
-    "frontend": "npm --prefix frontend run dev"
+    "frontend": "npm --prefix frontend run dev",
+    "test": "npm run test:integration",
+    "test:integration": "node tests/tmux-control.integration.mjs"
   }
 }
