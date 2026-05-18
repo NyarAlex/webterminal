@@ -30,7 +30,7 @@ import "./styles.css";
 
 type SessionMode = "local" | "ssh" | "local_cc" | "ssh_cc";
 type InteractionMode = "input" | "browse";
-type TmuxCommand = "new_window" | "split_horizontal" | "split_vertical" | "kill_pane";
+type TmuxCommand = "new_window" | "split_horizontal" | "split_vertical" | "kill_pane" | "zoom_pane";
 type ResizeDirection = "left" | "right" | "up" | "down";
 
 const ACTIVE_SESSION_STORAGE_KEY = "webterminal.activeSession";
@@ -39,6 +39,7 @@ const MAX_UPLOAD_BYTES = 24 * 1024 * 1024;
 const FILE_UPLOAD_CHUNK_CHARS = 2048;
 const DESKTOP_PANE_EDGE_GUARD_PX = 24;
 const DESKTOP_PANE_SEPARATOR_GAP_PX = 24;
+const TERMINAL_FIT_GUARD_PX = 18;
 
 function focusedPaneStorageKey(sessionId: string): string {
   return `webterminal.focusedPane.${sessionId}`;
@@ -67,6 +68,23 @@ function writeStoredValue(key: string, value: string | null) {
 function scrollTerminalToBottomSoon(term: Terminal) {
   term.scrollToBottom();
   window.requestAnimationFrame(() => term.scrollToBottom());
+}
+
+function terminalIsNearBottom(term: Terminal): boolean {
+  const buffer = term.buffer.active;
+  return buffer.baseY - buffer.viewportY <= 2;
+}
+
+function writeTerminalData(
+  term: Terminal,
+  data: Uint8Array,
+  shouldFollow: boolean,
+) {
+  const follow = shouldFollow && terminalIsNearBottom(term);
+  term.write(data);
+  if (follow) {
+    scrollTerminalToBottomSoon(term);
+  }
 }
 
 function attachTerminalKeyHandlers(term: Terminal, sendData: (data: string) => void) {
@@ -193,6 +211,7 @@ interface CreateSessionPayload {
 interface ResizeSessionPayload {
   cols: number;
   rows: number;
+  zoom_pane_id?: string | null;
 }
 
 interface TmuxState {
@@ -205,6 +224,7 @@ interface TmuxWindow {
   index: number | null;
   name: string;
   active: boolean;
+  zoomed: boolean;
   panes: TmuxPane[];
 }
 
@@ -334,6 +354,13 @@ function App() {
 
   useEffect(() => {
     void refresh().catch((err: unknown) => setError(String(err)));
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void refresh().catch((err: unknown) => setError(String(err)));
+    }, 5000);
+    return () => window.clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -686,6 +713,8 @@ function TerminalPane({
   const lastModeRef = React.useRef<InteractionMode>("input");
   const viewportRefreshTimerRef = React.useRef<number | null>(null);
   const wsReconnectTimerRef = React.useRef<number | null>(null);
+  const zoomReplayTimerRef = React.useRef<number | null>(null);
+  const handledResizeTokenRef = React.useRef(0);
   const focusedPaneRef = React.useRef<string | null>(null);
   const transferIdsRef = React.useRef(new Set<string>());
   const encoderRef = React.useRef(new TextEncoder());
@@ -701,7 +730,8 @@ function TerminalPane({
   const activePane = findActivePane(tmuxState, focusedPane);
   const activeWindow = findWindowForPane(tmuxState, activePane?.id ?? null);
   const visibleWindow = activeWindow ?? tmuxState?.windows[0] ?? null;
-  const desktopSplitEnabled = controlMode && visibleWindow !== null && visibleWindow.panes.length > 1;
+  const desktopSplitEnabled =
+    controlMode && visibleWindow !== null && visibleWindow.panes.length > 1 && !visibleWindow.zoomed;
   const activeContext =
     activeWindow && activePane
       ? `${windowLabel(activeWindow)} / ${paneLabel(activePane)}`
@@ -722,23 +752,59 @@ function TerminalPane({
       const container = containerRef.current;
       if (!term || !container) return;
 
+      const desktopGrid = desktopGridRef.current;
       const nextSize =
-        desktopSplitEnabled && desktopGridRef.current
-          ? measureDesktopGrid(desktopGridRef.current, term)
+        desktopSplitEnabled && desktopGrid && isVisibleMeasureTarget(desktopGrid)
+          ? measureDesktopGrid(desktopGrid, term)
           : measureTerminalGrid(container, term);
+      if (
+        controlMode &&
+        desktopSplitEnabled &&
+        desktopGrid &&
+        !isVisibleMeasureTarget(desktopGrid) &&
+        activePane &&
+        visibleWindow &&
+        !visibleWindow.zoomed
+      ) {
+        nextSize.zoom_pane_id = activePane.id;
+      }
+      const zoomPaneId = nextSize.zoom_pane_id;
       term.resize(nextSize.cols, nextSize.rows);
-      if (inputEnabledRef.current) {
+      if (inputEnabledRef.current && !zoomPaneId) {
         scrollTerminalToBottomSoon(term);
       }
 
       void api
         .resizeSession(session.id, nextSize)
-        .then(onResized)
+        .then((updated) => {
+          onResized(updated);
+          if (!zoomPaneId) return;
+          rememberFocusedPane(zoomPaneId);
+          if (zoomReplayTimerRef.current !== null) {
+            window.clearTimeout(zoomReplayTimerRef.current);
+          }
+          zoomReplayTimerRef.current = window.setTimeout(() => {
+            zoomReplayTimerRef.current = null;
+            const ws = wsRef.current;
+            if (ws?.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: "focus_pane", pane_id: zoomPaneId }));
+            }
+          }, 900);
+        })
         .catch((err: unknown) => {
           onError(err instanceof Error ? err.message : String(err));
         });
     },
-    [desktopSplitEnabled, session.id, onResized, onError],
+    [
+      activePane,
+      controlMode,
+      desktopSplitEnabled,
+      session.id,
+      onResized,
+      onError,
+      rememberFocusedPane,
+      visibleWindow,
+    ],
   );
 
   const scheduleLocalViewportRefresh = useCallback((delay = 120) => {
@@ -765,6 +831,10 @@ function TerminalPane({
       if (wsReconnectTimerRef.current !== null) {
         window.clearTimeout(wsReconnectTimerRef.current);
         wsReconnectTimerRef.current = null;
+      }
+      if (zoomReplayTimerRef.current !== null) {
+        window.clearTimeout(zoomReplayTimerRef.current);
+        zoomReplayTimerRef.current = null;
       }
     };
   }, []);
@@ -893,17 +963,11 @@ function TerminalPane({
       ws.onmessage = (event) => {
         if (disposed || wsRef.current !== ws) return;
         if (event.data instanceof ArrayBuffer) {
-          term.write(new Uint8Array(event.data));
-          if (inputEnabledRef.current) {
-            scrollTerminalToBottomSoon(term);
-          }
+          writeTerminalData(term, new Uint8Array(event.data), inputEnabledRef.current);
         } else if (event.data instanceof Blob) {
           void event.data.arrayBuffer().then((buffer) => {
             if (!disposed && wsRef.current === ws) {
-              term.write(new Uint8Array(buffer));
-              if (inputEnabledRef.current) {
-                scrollTerminalToBottomSoon(term);
-              }
+              writeTerminalData(term, new Uint8Array(buffer), inputEnabledRef.current);
             }
           });
         } else {
@@ -928,7 +992,9 @@ function TerminalPane({
             },
           );
           if (terminalChanged && inputEnabledRef.current) {
-            scrollTerminalToBottomSoon(term);
+            if (terminalIsNearBottom(term)) {
+              scrollTerminalToBottomSoon(term);
+            }
           }
         }
       };
@@ -972,6 +1038,10 @@ function TerminalPane({
       if (viewportRefreshTimerRef.current !== null) {
         window.clearTimeout(viewportRefreshTimerRef.current);
         viewportRefreshTimerRef.current = null;
+      }
+      if (zoomReplayTimerRef.current !== null) {
+        window.clearTimeout(zoomReplayTimerRef.current);
+        zoomReplayTimerRef.current = null;
       }
       dataSub.dispose();
       detachPasteHandler();
@@ -1113,6 +1183,8 @@ function TerminalPane({
 
   useEffect(() => {
     if (resizeToken === 0) return;
+    if (handledResizeTokenRef.current === resizeToken) return;
+    handledResizeTokenRef.current = resizeToken;
     resizeTerminalToContainer();
   }, [resizeToken, resizeTerminalToContainer]);
 
@@ -1125,9 +1197,31 @@ function TerminalPane({
   const focusPane = (paneId: string) => {
     const ws = wsRef.current;
     if (ws?.readyState !== WebSocket.OPEN) return;
+    const targetWindow = findWindowForPane(tmuxState, paneId);
+    const shouldZoomBeforeFocus =
+      controlMode &&
+      targetWindow !== null &&
+      targetWindow.panes.length > 1 &&
+      !targetWindow.zoomed &&
+      !window.matchMedia("(min-width: 761px)").matches;
+
     setInteractionMode("input");
     rememberFocusedPane(paneId);
     termRef.current?.clear();
+    if (shouldZoomBeforeFocus) {
+      ws.send(JSON.stringify({ type: "tmux_command", command: "zoom_pane", pane_id: paneId }));
+      if (zoomReplayTimerRef.current !== null) {
+        window.clearTimeout(zoomReplayTimerRef.current);
+      }
+      zoomReplayTimerRef.current = window.setTimeout(() => {
+        zoomReplayTimerRef.current = null;
+        const currentWs = wsRef.current;
+        if (currentWs?.readyState === WebSocket.OPEN) {
+          currentWs.send(JSON.stringify({ type: "focus_pane", pane_id: paneId }));
+        }
+      }, 900);
+      return;
+    }
     ws.send(JSON.stringify({ type: "focus_pane", pane_id: paneId }));
   };
 
@@ -1313,7 +1407,10 @@ function TerminalPane({
 function measureTerminalGrid(container: HTMLElement, term: Terminal): ResizeSessionPayload {
   const styles = window.getComputedStyle(container);
   const width =
-    container.clientWidth - parseFloat(styles.paddingLeft) - parseFloat(styles.paddingRight);
+    container.clientWidth -
+    parseFloat(styles.paddingLeft) -
+    parseFloat(styles.paddingRight) -
+    TERMINAL_FIT_GUARD_PX;
   const height =
     container.clientHeight - parseFloat(styles.paddingTop) - parseFloat(styles.paddingBottom);
   const screen = container.querySelector<HTMLElement>(".xterm-screen");
@@ -1327,6 +1424,12 @@ function measureTerminalGrid(container: HTMLElement, term: Terminal): ResizeSess
     cols: clamp(Math.floor(width / cellWidth), 40, 240),
     rows: clamp(Math.floor(height / cellHeight), 12, 80),
   };
+}
+
+function isVisibleMeasureTarget(element: HTMLElement): boolean {
+  if (element.clientWidth <= 0 || element.clientHeight <= 0) return false;
+  const styles = window.getComputedStyle(element);
+  return styles.display !== "none" && styles.visibility !== "hidden";
 }
 
 function measureDesktopGrid(grid: HTMLElement, fallbackTerm: Terminal): ResizeSessionPayload {
@@ -1346,14 +1449,16 @@ function measureDesktopGrid(grid: HTMLElement, fallbackTerm: Terminal): ResizeSe
   const rect = screen?.getBoundingClientRect();
   const cols = Number(surface?.dataset.cols ?? 0);
   const rows = Number(surface?.dataset.rows ?? 0);
-  const cellWidth =
+  const measuredCellWidth =
     rect && rect.width > 0 && cols > 0
       ? rect.width / cols
-      : getFallbackCellWidth(fallbackTerm);
-  const cellHeight =
+      : null;
+  const measuredCellHeight =
     rect && rect.height > 0 && rows > 0
       ? rect.height / rows
-      : getFallbackCellHeight(fallbackTerm);
+      : null;
+  const cellWidth = Math.max(measuredCellWidth ?? 0, getFallbackCellWidth(fallbackTerm));
+  const cellHeight = Math.max(measuredCellHeight ?? 0, getFallbackCellHeight(fallbackTerm));
   const verticalBoundaries = new Set(
     surfaces
       .map((item) => Number(item.dataset.paneLeft ?? 0))
@@ -1362,6 +1467,7 @@ function measureDesktopGrid(grid: HTMLElement, fallbackTerm: Terminal): ResizeSe
   const reservedWidth =
     verticalBoundaries.size * DESKTOP_PANE_SEPARATOR_GAP_PX +
     DESKTOP_PANE_EDGE_GUARD_PX +
+    TERMINAL_FIT_GUARD_PX +
     2;
   const safetyRows = surfaces.length > 1 ? 1 : 0;
 
@@ -1441,6 +1547,8 @@ const DesktopPaneGrid = React.forwardRef<HTMLDivElement, {
   onResizePane,
 }, ref) {
   const [cellSize, setCellSize] = useState<{ width: number; height: number } | null>(null);
+  const [gridSize, setGridSize] = useState<{ width: number; height: number } | null>(null);
+  const gridRef = React.useRef<HTMLDivElement | null>(null);
   const hasGeometry = window.panes.every(
     (pane) => pane.left !== null && pane.top !== null && pane.width !== null && pane.height !== null,
   );
@@ -1472,22 +1580,63 @@ const DesktopPaneGrid = React.forwardRef<HTMLDivElement, {
       return { width, height };
     });
   }, []);
-  const pixelGeometry = hasGeometry && cellSize !== null;
+  const setGridRefs = useCallback(
+    (node: HTMLDivElement | null) => {
+      gridRef.current = node;
+      if (typeof ref === "function") {
+        ref(node);
+      } else if (ref) {
+        ref.current = node;
+      }
+    },
+    [ref],
+  );
+
+  useEffect(() => {
+    const node = gridRef.current;
+    if (!node) return;
+    const parent = node.parentElement;
+
+    const updateGridSize = () => {
+      const width = parent?.clientWidth ?? node.clientWidth;
+      const height = parent
+        ? Math.max(parent.clientHeight - node.offsetTop, 0)
+        : node.clientHeight;
+      if (width <= 0 || height <= 0) return;
+      setGridSize((current) => {
+        if (current && current.width === width && current.height === height) return current;
+        return { width, height };
+      });
+    };
+
+    updateGridSize();
+    const observer = new ResizeObserver(updateGridSize);
+    observer.observe(parent ?? node);
+    return () => observer.disconnect();
+  }, []);
+
+  const horizontalReserve =
+    verticalBoundaries.length * DESKTOP_PANE_SEPARATOR_GAP_PX + DESKTOP_PANE_EDGE_GUARD_PX + 2;
+  const effectiveCellSize =
+    cellSize && gridSize
+      ? {
+          width: Math.max(1, Math.min(cellSize.width, (gridSize.width - horizontalReserve) / maxRight)),
+          height: Math.max(1, Math.min(cellSize.height, (gridSize.height - 2) / maxBottom)),
+        }
+      : cellSize;
+  const pixelGeometry = hasGeometry && effectiveCellSize !== null && gridSize !== null;
   const gridStyle: React.CSSProperties | undefined = pixelGeometry
     ? {
         width: `${
-          Math.ceil(maxRight * cellSize.width) +
-          verticalBoundaries.length * DESKTOP_PANE_SEPARATOR_GAP_PX +
-          DESKTOP_PANE_EDGE_GUARD_PX +
-          2
+          Math.ceil(maxRight * effectiveCellSize.width) + horizontalReserve
         }px`,
-        height: `${Math.ceil(maxBottom * cellSize.height) + 2}px`,
+        height: `${Math.ceil(maxBottom * effectiveCellSize.height) + 2}px`,
       }
     : undefined;
 
   return (
     <div
-      ref={ref}
+      ref={setGridRefs}
       className={`desktopPaneGrid ${hasGeometry ? "geometry" : "fallback"} ${pixelGeometry ? "pixelGeometry" : ""}`}
       style={gridStyle}
     >
@@ -1500,10 +1649,10 @@ const DesktopPaneGrid = React.forwardRef<HTMLDivElement, {
         const style: React.CSSProperties = hasGeometry
           ? pixelGeometry
             ? {
-                left: `${Math.round(left * cellSize.width) + boundariesBefore * DESKTOP_PANE_SEPARATOR_GAP_PX}px`,
-                top: `${Math.round(top * cellSize.height)}px`,
-                width: `${Math.ceil(width * cellSize.width) + DESKTOP_PANE_EDGE_GUARD_PX + 2}px`,
-                height: `${Math.ceil(height * cellSize.height) + 2}px`,
+                left: `${Math.round(left * effectiveCellSize.width) + boundariesBefore * DESKTOP_PANE_SEPARATOR_GAP_PX}px`,
+                top: `${Math.round(top * effectiveCellSize.height)}px`,
+                width: `${Math.ceil(width * effectiveCellSize.width) + DESKTOP_PANE_EDGE_GUARD_PX + 2}px`,
+                height: `${Math.ceil(height * effectiveCellSize.height) + 2}px`,
               }
             : {
                 left: `${(left / maxRight) * 100}%`,
@@ -1555,12 +1704,22 @@ function PaneTerminal({
   const wsRef = React.useRef<WebSocket | null>(null);
   const reconnectTimerRef = React.useRef<number | null>(null);
   const encoderRef = React.useRef(new TextEncoder());
+  const interactionModeRef = React.useRef(interactionMode);
+  const selectedRef = React.useRef(selected);
   const dragRef = React.useRef<{
     x: number;
     y: number;
     axis: "x" | "y";
     pointerId: number;
   } | null>(null);
+
+  useEffect(() => {
+    interactionModeRef.current = interactionMode;
+  }, [interactionMode]);
+
+  useEffect(() => {
+    selectedRef.current = selected;
+  }, [selected]);
 
   useEffect(() => {
     const term = new Terminal({
@@ -1583,7 +1742,7 @@ function PaneTerminal({
     term.loadAddon(new WebLinksAddon());
     attachTerminalKeyHandlers(term, (data) => {
       const ws = wsRef.current;
-      if (interactionMode === "input" && ws?.readyState === WebSocket.OPEN) {
+      if (interactionModeRef.current === "input" && ws?.readyState === WebSocket.OPEN) {
         ws.send(encoderRef.current.encode(data));
       }
     });
@@ -1593,7 +1752,7 @@ function PaneTerminal({
     term.open(containerRef.current);
     const detachPasteHandler = attachPasteHandler(containerRef.current, (data) => {
       const ws = wsRef.current;
-      if (interactionMode === "input" && ws?.readyState === WebSocket.OPEN) {
+      if (interactionModeRef.current === "input" && ws?.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "paste", data, pane_id: pane.id }));
       }
     });
@@ -1652,7 +1811,7 @@ function PaneTerminal({
         reconnectAttempt = 0;
         term.clear();
         ws.send(JSON.stringify({ type: "focus_pane", pane_id: pane.id }));
-        if (interactionMode === "input") {
+        if (interactionModeRef.current === "input" && selectedRef.current) {
           scrollTerminalToBottomSoon(term);
         }
       };
@@ -1666,23 +1825,18 @@ function PaneTerminal({
       };
       ws.onmessage = (event) => {
         if (disposed || wsRef.current !== ws) return;
+        const shouldFollow = interactionModeRef.current === "input" && selectedRef.current;
         if (event.data instanceof ArrayBuffer) {
-          term.write(new Uint8Array(event.data));
-          if (interactionMode === "input") {
-            scrollTerminalToBottomSoon(term);
-          }
+          writeTerminalData(term, new Uint8Array(event.data), shouldFollow);
         } else if (event.data instanceof Blob) {
           void event.data.arrayBuffer().then((buffer) => {
             if (!disposed && wsRef.current === ws) {
-              term.write(new Uint8Array(buffer));
-              if (interactionMode === "input") {
-                scrollTerminalToBottomSoon(term);
-              }
+              writeTerminalData(term, new Uint8Array(buffer), shouldFollow);
             }
           });
         } else {
           const terminalChanged = handlePaneTerminalTextMessage(String(event.data), term);
-          if (terminalChanged && interactionMode === "input") {
+          if (terminalChanged && shouldFollow && terminalIsNearBottom(term)) {
             scrollTerminalToBottomSoon(term);
           }
         }
@@ -1691,7 +1845,7 @@ function PaneTerminal({
 
     const restoreInputViewport = () => {
       if (document.hidden) return;
-      if (interactionMode === "input") {
+      if (interactionModeRef.current === "input" && selectedRef.current) {
         scrollTerminalToBottomSoon(term);
       }
     };
@@ -1712,7 +1866,7 @@ function PaneTerminal({
 
     const dataSub = term.onData((data) => {
       const ws = wsRef.current;
-      if (interactionMode === "input" && ws?.readyState === WebSocket.OPEN) {
+      if (interactionModeRef.current === "input" && ws?.readyState === WebSocket.OPEN) {
         ws.send(encoderRef.current.encode(data));
       }
     });
@@ -1730,7 +1884,7 @@ function PaneTerminal({
       termRef.current = null;
       wsRef.current = null;
     };
-  }, [interactionMode, onCellSize, pane.height, pane.id, pane.width, sessionId]);
+  }, [onCellSize, pane.height, pane.id, pane.left, pane.top, pane.width, sessionId]);
 
   useEffect(() => {
     const term = termRef.current;
@@ -1741,6 +1895,64 @@ function PaneTerminal({
       scrollTerminalToBottomSoon(term);
     }
   }, [interactionMode, selected]);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    const term = termRef.current;
+    if (!container || !term) return;
+
+    let lastTouchY: number | null = null;
+    let scrollRemainder = 0;
+    const lineThreshold = 12;
+
+    const scrollHistory = (deltaY: number) => {
+      const currentTerm = termRef.current;
+      if (!currentTerm) return;
+      scrollRemainder += deltaY;
+      const lines = Math.trunc(scrollRemainder / lineThreshold);
+      if (lines !== 0) {
+        scrollRemainder -= lines * lineThreshold;
+        currentTerm.scrollLines(lines);
+      }
+    };
+
+    const onWheel = (event: WheelEvent) => {
+      if ((event.target as HTMLElement | null)?.closest(".paneResizeHandle")) return;
+      event.preventDefault();
+      scrollHistory(event.deltaY);
+    };
+
+    const onTouchStart = (event: TouchEvent) => {
+      if ((event.target as HTMLElement | null)?.closest(".paneResizeHandle")) return;
+      lastTouchY = event.touches.length === 1 ? event.touches[0].clientY : null;
+    };
+
+    const onTouchMove = (event: TouchEvent) => {
+      if (lastTouchY === null || event.touches.length !== 1) return;
+      const nextY = event.touches[0].clientY;
+      scrollHistory(lastTouchY - nextY);
+      lastTouchY = nextY;
+      event.preventDefault();
+    };
+
+    const onTouchEnd = () => {
+      lastTouchY = null;
+    };
+
+    container.addEventListener("wheel", onWheel, { capture: true, passive: false });
+    container.addEventListener("touchstart", onTouchStart, { capture: true, passive: true });
+    container.addEventListener("touchmove", onTouchMove, { capture: true, passive: false });
+    container.addEventListener("touchend", onTouchEnd, { capture: true });
+    container.addEventListener("touchcancel", onTouchEnd, { capture: true });
+
+    return () => {
+      container.removeEventListener("wheel", onWheel, { capture: true });
+      container.removeEventListener("touchstart", onTouchStart, { capture: true });
+      container.removeEventListener("touchmove", onTouchMove, { capture: true });
+      container.removeEventListener("touchend", onTouchEnd, { capture: true });
+      container.removeEventListener("touchcancel", onTouchEnd, { capture: true });
+    };
+  }, []);
 
   const startResizeDrag = (
     event: React.PointerEvent<HTMLButtonElement>,

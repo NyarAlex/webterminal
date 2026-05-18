@@ -646,7 +646,8 @@ input:disabled {
   grid-row: 5;
   min-height: 0;
   padding: 8px;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   overscroll-behavior: contain;
   user-select: text;
   -webkit-user-select: text;
@@ -712,21 +713,44 @@ input:disabled {
   top: 5px;
   right: 8px;
   z-index: 2;
-  max-width: calc(100% - 16px);
+  width: 6px;
+  max-width: 6px;
   overflow: hidden;
-  padding: 2px 6px;
+  padding: 2px 0;
   border: 1px solid #34414a;
   border-radius: 6px;
-  background: rgba(16, 19, 21, 0.88);
-  color: #9aa8b0;
+  background: rgba(213, 169, 61, 0.45);
+  color: transparent;
   font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
   pointer-events: none;
+  opacity: 0.72;
+  transition:
+    max-width 120ms ease,
+    width 120ms ease,
+    padding 120ms ease,
+    background 120ms ease,
+    color 120ms ease,
+    opacity 120ms ease;
+}
+
+.desktopPane:hover .desktopPaneLabel {
+  width: auto;
+  max-width: calc(100% - 16px);
+  padding: 2px 6px;
+  background: rgba(16, 19, 21, 0.9);
+  color: #9aa8b0;
+  opacity: 1;
 }
 
 .desktopPane.selected .desktopPaneLabel {
   border-color: #d5a93d;
+  background: rgba(213, 169, 61, 0.72);
+}
+
+.desktopPane.selected:hover .desktopPaneLabel {
+  background: rgba(16, 19, 21, 0.9);
   color: #f3c969;
 }
 
@@ -826,7 +850,7 @@ input:disabled {
 }
 
 .mobileKeybar {
-  grid-row: 5;
+  grid-row: 6;
   display: none;
   gap: 6px;
   align-items: center;
@@ -1117,7 +1141,7 @@ input:disabled {
   }
 
   .terminalWrap {
-    grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+    grid-template-rows: auto auto auto auto minmax(0, 1fr) auto;
   }
 
   .tmuxNavigator {

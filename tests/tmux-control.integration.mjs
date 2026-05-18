@@ -108,6 +108,7 @@ function connect(sessionId, label = "client") {
   const ws = new WebSocket(wsUrl);
   const states = [];
   const focusEvents = [];
+  const clearEvents = [];
   const fileDownloads = [];
   const fileStatuses = [];
   const chunks = [];
@@ -117,6 +118,7 @@ function connect(sessionId, label = "client") {
         const message = JSON.parse(event.data);
         if (message.type === "tmux_state") states.push(message.state);
         if (message.type === "focus_pane") focusEvents.push(message.pane_id);
+        if (message.type === "clear") clearEvents.push(message);
         if (message.type === "file_download") fileDownloads.push(message);
         if (message.type === "file_transfer_status") fileStatuses.push(message);
       } catch {
@@ -132,7 +134,7 @@ function connect(sessionId, label = "client") {
     chunks.push(new TextDecoder().decode(bytes));
   });
 
-  return { label, ws, states, focusEvents, fileDownloads, fileStatuses, chunks };
+  return { label, ws, states, focusEvents, clearEvents, fileDownloads, fileStatuses, chunks };
 }
 
 async function waitOpen(client) {
@@ -316,6 +318,69 @@ async function testResizeKeepsControlModeAndLabels() {
   await deleteSession(session.id);
 }
 
+async function testMobileFixZoomDoesNotReplayLoop() {
+  const session = await createSession({
+    name: "it-mobile-fix-zoom",
+    mode: "local_cc",
+    cols: 82,
+    rows: 28,
+    tmux_name: `wt_it_zoom_${Date.now()}`,
+  });
+  const client = connect(session.id, "zoom-client");
+  await waitOpen(client);
+  let state = await waitState(client, (next) => panes(next).length === 1, "initial pane");
+  const firstPane = panes(state)[0];
+
+  sendJson(client, { type: "tmux_command", command: "split_horizontal", pane_id: firstPane.id });
+  state = await waitState(client, (next) => panes(next).length === 2, "horizontal split");
+  const splitPane = panes(state).find((pane) => pane.id !== firstPane.id);
+  assert(splitPane, "expected split pane");
+  sendJson(client, { type: "focus_pane", pane_id: firstPane.id });
+  await sleep(150);
+
+  const clearCountBefore = client.clearEvents.length;
+  const chunkCountBefore = client.chunks.length;
+  const resize = await fetch(`${baseUrl}/api/sessions/${session.id}/resize`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ cols: 82, rows: 30, zoom_pane_id: firstPane.id }),
+  });
+  assert(resize.ok, `zoom resize failed: ${resize.status} ${await resize.text()}`);
+
+  state = await waitState(
+    client,
+    (next) => {
+      const activeWindow = next.windows.find((window) =>
+        window.panes.some((pane) => pane.id === firstPane.id),
+      );
+      const activePane = panes(next).find((pane) => pane.id === firstPane.id);
+      return activeWindow?.zoomed && activePane?.width === 82 && activePane?.height === 30;
+    },
+    "zoomed pane after mobile fix resize",
+  );
+  const activeWindow = state.windows.find((window) => window.panes.some((pane) => pane.id === firstPane.id));
+  const activePane = panes(state).find((pane) => pane.id === firstPane.id);
+  assert(activeWindow?.zoomed, "window should be zoomed after mobile fix");
+  assert(activePane?.width === 82, `zoomed pane width mismatch: ${activePane?.width}`);
+  assert(activePane?.height === 30, `zoomed pane height mismatch: ${activePane?.height}`);
+
+  await sleep(1000);
+  assert(
+    client.clearEvents.length === clearCountBefore,
+    `resize broadcast ${client.clearEvents.length - clearCountBefore} clear events`,
+  );
+  const resizeOutputBytes = client.chunks
+    .slice(chunkCountBefore)
+    .reduce((total, chunk) => total + chunk.length, 0);
+  assert(
+    resizeOutputBytes < 32 * 1024,
+    `resize replayed too much output: ${resizeOutputBytes} bytes`,
+  );
+
+  await closeClient(client);
+  await deleteSession(session.id);
+}
+
 async function testTerminalFileBridge() {
   const session = await createSession({
     name: "it-file-bridge",
@@ -378,6 +443,9 @@ async function run() {
 
   await testResizeKeepsControlModeAndLabels();
   log("ok resize preserves tmux control labels and commands");
+
+  await testMobileFixZoomDoesNotReplayLoop();
+  log("ok mobile fix zooms pane without replay loop");
 
   await testTerminalFileBridge();
   log("ok terminal file bridge upload/download");

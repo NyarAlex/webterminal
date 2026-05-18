@@ -35,9 +35,9 @@ use uuid::Uuid;
 
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 36;
-const REPLAY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
-const INITIAL_REPLAY_LIMIT_BYTES: usize = 512 * 1024;
-const CAPTURE_PANE_HISTORY_LINES: u16 = 1000;
+const REPLAY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+const INITIAL_REPLAY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+const CAPTURE_PANE_HISTORY_LINES: u16 = 5000;
 const FILE_TRANSFER_BASE64_LIMIT: usize = 64 * 1024 * 1024;
 const DIRECT_STREAM_ID: &str = "__direct__";
 const DOWNLOAD_BEGIN_MARKER: &str = "__WEBTERMINAL_DOWNLOAD_BEGIN__:";
@@ -162,8 +162,10 @@ struct TmuxCapture {
 #[derive(Clone)]
 enum SessionEvent {
     Output(Vec<u8>),
-    PaneOutput { pane_id: String, data: Vec<u8> },
-    PaneSnapshot { pane_id: String, data: Vec<u8> },
+    PaneOutput {
+        pane_id: String,
+        data: Vec<u8>,
+    },
     TmuxState(TmuxStateSnapshot),
     FileDownload {
         id: String,
@@ -189,6 +191,7 @@ struct TmuxWindow {
     index: Option<u16>,
     name: String,
     active: bool,
+    zoomed: bool,
     panes: Vec<TmuxPane>,
 }
 
@@ -263,6 +266,7 @@ enum TmuxUiCommand {
     SplitHorizontal,
     SplitVertical,
     KillPane,
+    ZoomPane,
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,8 +282,12 @@ enum TmuxResizeDirection {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerMessage<'a> {
     Clear,
-    FocusPane { pane_id: &'a str },
-    TmuxState { state: TmuxStateSnapshot },
+    FocusPane {
+        pane_id: &'a str,
+    },
+    TmuxState {
+        state: TmuxStateSnapshot,
+    },
     FileDownload {
         id: &'a str,
         filename_base64: &'a str,
@@ -314,6 +322,7 @@ impl TmuxControlState {
             index: Some(0),
             name: "tmux".to_string(),
             active: true,
+            zoomed: false,
             panes: Vec::new(),
         });
         window.panes.push(TmuxPane {
@@ -421,12 +430,8 @@ impl TerminalSession {
                 .pane_replay
                 .entry(pane_id.to_string())
                 .or_insert_with(ReplayBuffer::new);
-            replay.replace(snapshot.clone());
+            replay.replace(snapshot);
         }
-        let _ = self.output_tx.send(SessionEvent::PaneSnapshot {
-            pane_id: pane_id.to_string(),
-            data: snapshot,
-        });
     }
 
     fn replay_tail_chunks(&self) -> Vec<Vec<u8>> {
@@ -551,7 +556,7 @@ impl TerminalSession {
 
         self.write_raw_input(
             format!(
-                "list-windows -F 'WT_WINDOW\t{generation}\t#{{window_id}}\t#{{window_index}}\t#{{window_name}}\t#{{window_active}}'\n\
+                "list-windows -F 'WT_WINDOW\t{generation}\t#{{window_id}}\t#{{window_index}}\t#{{window_name}}\t#{{window_active}}\t#{{window_zoomed_flag}}'\n\
                  list-panes -s -F 'WT_PANE\t{generation}\t#{{window_id}}\t#{{pane_id}}\t#{{pane_index}}\t#{{pane_active}}\t#{{pane_current_command}}\t#{{pane_current_path}}\t#{{pane_left}}\t#{{pane_top}}\t#{{pane_width}}\t#{{pane_height}}'\n\
                  display-message -p 'WT_DONE\t{generation}'\n"
             )
@@ -602,8 +607,16 @@ impl TerminalSession {
             TmuxUiCommand::KillPane => {
                 format!("kill-pane{}\n", tmux_target_arg(target.as_deref()))
             }
+            TmuxUiCommand::ZoomPane => {
+                format!("resize-pane -Z{}\n", tmux_target_arg(target.as_deref()))
+            }
         };
         self.write_raw_input(command.into_bytes())?;
+        self.request_tmux_state_refresh()
+    }
+
+    fn zoom_tmux_pane(&self, pane_id: &str) -> Result<()> {
+        self.write_raw_input(format!("resize-pane -Z -t {}\n", tmux_quote(pane_id)).into_bytes())?;
         self.request_tmux_state_refresh()
     }
 
@@ -621,11 +634,7 @@ impl TerminalSession {
             TmuxResizeDirection::Down => "-D",
         };
         self.write_raw_input(
-            format!(
-                "resize-pane -t {} {flag} {amount}\n",
-                tmux_quote(pane_id)
-            )
-            .into_bytes(),
+            format!("resize-pane -t {} {flag} {amount}\n", tmux_quote(pane_id)).into_bytes(),
         )?;
         self.request_tmux_state_refresh()
     }
@@ -706,7 +715,10 @@ impl TerminalSession {
         pane_id: Option<String>,
     ) -> Result<()> {
         validate_transfer_id(id)?;
-        self.write_file_transfer_input(file_upload_start_command(path, tmp_path).into_bytes(), pane_id)
+        self.write_file_transfer_input(
+            file_upload_start_command(path, tmp_path).into_bytes(),
+            pane_id,
+        )
     }
 
     fn write_file_upload_chunk(
@@ -715,7 +727,10 @@ impl TerminalSession {
         tmp_path: &str,
         pane_id: Option<String>,
     ) -> Result<()> {
-        self.write_file_transfer_input(file_upload_chunk_command(data, tmp_path)?.into_bytes(), pane_id)
+        self.write_file_transfer_input(
+            file_upload_chunk_command(data, tmp_path)?.into_bytes(),
+            pane_id,
+        )
     }
 
     fn finish_file_upload(
@@ -780,7 +795,9 @@ impl TerminalSession {
 
     fn mark_exited(&self) {
         if self.alive.swap(false, Ordering::Relaxed) {
-            self.append_direct_output(b"\r\n[terminal process exited; reopen the session to reconnect]\r\n");
+            self.append_direct_output(
+                b"\r\n[terminal process exited; reopen the session to reconnect]\r\n",
+            );
         }
     }
 
@@ -1042,9 +1059,11 @@ fn trim_terminal_marker_prefix(mut text: &str) -> &str {
 }
 
 fn split_transfer_marker(rest: &str) -> (&str, Option<&str>) {
-    rest.trim().split_once(':').map_or((rest.trim(), None), |(id, value)| {
-        (id.trim(), Some(value.trim()))
-    })
+    rest.trim()
+        .split_once(':')
+        .map_or((rest.trim(), None), |(id, value)| {
+            (id.trim(), Some(value.trim()))
+        })
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -1080,6 +1099,7 @@ struct CreateSessionRequest {
 struct ResizeSessionRequest {
     cols: u16,
     rows: u16,
+    zoom_pane_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1426,6 +1446,9 @@ async fn resize_session(
         .ok_or_else(|| anyhow!("session not found"))?;
     let cols = req.cols.clamp(40, 240);
     let rows = req.rows.clamp(12, 80);
+    if let Some(pane_id) = req.zoom_pane_id.as_deref() {
+        session.zoom_tmux_pane(pane_id)?;
+    }
     session.resize(cols, rows)?;
     if let Err(err) = state.store.update_size(id, cols, rows) {
         warn!(session = %id, error = %err, "failed to persist session size");
@@ -1501,6 +1524,7 @@ async fn handle_socket(
     let mut uploads: HashMap<String, UploadState> = HashMap::new();
 
     if let Some(state) = session.tmux_state_snapshot() {
+        let has_tmux_panes = state.windows.iter().any(|window| !window.panes.is_empty());
         if send_server_message(&mut socket, &ServerMessage::TmuxState { state })
             .await
             .is_err()
@@ -1510,17 +1534,29 @@ async fn handle_socket(
             }
             return;
         }
-        if let Some(pane_id) = focused_pane.as_deref() {
-            if send_focus_and_replay(&mut socket, &session, pane_id)
-                .await
-                .is_err()
-            {
-                if count_viewer {
-                    session.viewers.fetch_sub(1, Ordering::Relaxed);
+        if has_tmux_panes {
+            if let Some(pane_id) = focused_pane.as_deref() {
+                if send_focus_and_replay(&mut socket, &session, pane_id)
+                    .await
+                    .is_err()
+                {
+                    if count_viewer {
+                        session.viewers.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    return;
                 }
-                return;
             }
-        } else if let Err(err) = session.request_tmux_state_refresh() {
+        } else {
+            for chunk in session.replay_tail_chunks() {
+                if socket.send(Message::Binary(chunk.into())).await.is_err() {
+                    if count_viewer {
+                        session.viewers.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    return;
+                }
+            }
+        }
+        if !has_tmux_panes && let Err(err) = session.request_tmux_state_refresh() {
             warn!(session = %session.id, error = %err, "failed to request tmux state");
         }
     } else {
@@ -1737,16 +1773,6 @@ async fn handle_socket(
                             && socket.send(Message::Binary(data.into())).await.is_err() {
                                 break;
                             }
-                    }
-                    Ok(SessionEvent::PaneSnapshot { pane_id, data }) => {
-                        if focused_pane.as_deref() == Some(pane_id.as_str()) {
-                            if send_server_message(&mut socket, &ServerMessage::Clear).await.is_err() {
-                                break;
-                            }
-                            if socket.send(Message::Binary(data.into())).await.is_err() {
-                                break;
-                            }
-                        }
                     }
                     Ok(SessionEvent::TmuxState(state)) => {
                         if focused_pane.is_none() {
@@ -2119,7 +2145,8 @@ fn handle_tmux_capture_control_line(
     if {
         let state = state.lock().expect("tmux control state lock poisoned");
         state.active_capture.is_some()
-    } && !line.starts_with(b"%end ") && !line.starts_with(b"%error ")
+    } && !line.starts_with(b"%end ")
+        && !line.starts_with(b"%error ")
     {
         append_tmux_capture_line(state, line);
         return true;
@@ -2165,8 +2192,8 @@ fn handle_tmux_state_line(
         return false;
     };
     if let Some(rest) = text.strip_prefix("WT_WINDOW\t") {
-        let parts = rest.splitn(5, '\t').collect::<Vec<_>>();
-        if parts.len() == 5 {
+        let parts = rest.splitn(6, '\t').collect::<Vec<_>>();
+        if parts.len() == 6 {
             let generation = parts[0].parse::<u64>().ok();
             let mut state = state.lock().expect("tmux control state lock poisoned");
             if state.pending_generation == generation {
@@ -2177,6 +2204,7 @@ fn handle_tmux_state_line(
                         index: parts[2].parse::<u16>().ok(),
                         name: parts[3].to_string(),
                         active: parts[4] == "1",
+                        zoomed: parts[5] == "1",
                         panes: Vec::new(),
                     },
                 );
@@ -2230,6 +2258,7 @@ fn handle_tmux_state_line(
                             index: None,
                             name: pane.window_id.clone(),
                             active: false,
+                            zoomed: false,
                             panes: Vec::new(),
                         })
                         .panes
@@ -2303,8 +2332,7 @@ fn should_capture_pane_snapshot(command: &str) -> bool {
     let command = command.rsplit('/').next().unwrap_or(command);
     !matches!(
         command,
-        "vi"
-            | "vim"
+        "vi" | "vim"
             | "nvim"
             | "view"
             | "less"
@@ -2315,7 +2343,6 @@ fn should_capture_pane_snapshot(command: &str) -> bool {
             | "btop"
             | "nano"
             | "emacs"
-            | "ssh"
             | "scp"
             | "sftp"
     )
@@ -2415,7 +2442,9 @@ fn tmux_target_pane(
     if !state.initialized {
         return None;
     }
-    pane_override.map(ToOwned::to_owned).or_else(|| state.active_pane.clone())
+    pane_override
+        .map(ToOwned::to_owned)
+        .or_else(|| state.active_pane.clone())
 }
 
 fn encode_tmux_control_input(pane: &str, data: &[u8]) -> Vec<u8> {
@@ -2876,9 +2905,7 @@ fn upload_tmp_path(path: &str, id: &str) -> String {
 fn file_upload_start_command(path: &str, tmp_path: &str) -> String {
     let path = shell_escape(path);
     let tmp_b64 = shell_escape(&format!("{tmp_path}.b64"));
-    format!(
-        "__wt_path={path}; : > {tmp_b64}\r"
-    )
+    format!("__wt_path={path}; : > {tmp_b64}\r")
 }
 
 fn file_upload_chunk_command(data: &str, tmp_path: &str) -> Result<String> {
