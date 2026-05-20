@@ -109,6 +109,7 @@ function connect(sessionId, label = "client") {
   const states = [];
   const focusEvents = [];
   const clearEvents = [];
+  const paneSnapshots = [];
   const fileDownloads = [];
   const fileStatuses = [];
   const chunks = [];
@@ -119,6 +120,10 @@ function connect(sessionId, label = "client") {
         if (message.type === "tmux_state") states.push(message.state);
         if (message.type === "focus_pane") focusEvents.push(message.pane_id);
         if (message.type === "clear") clearEvents.push(message);
+        if (message.type === "pane_output") {
+          chunks.push(Buffer.from(message.data_base64, "base64").toString("utf8"));
+        }
+        if (message.type === "pane_snapshot") paneSnapshots.push(message);
         if (message.type === "file_download") fileDownloads.push(message);
         if (message.type === "file_transfer_status") fileStatuses.push(message);
       } catch {
@@ -134,7 +139,7 @@ function connect(sessionId, label = "client") {
     chunks.push(new TextDecoder().decode(bytes));
   });
 
-  return { label, ws, states, focusEvents, clearEvents, fileDownloads, fileStatuses, chunks };
+  return { label, ws, states, focusEvents, clearEvents, paneSnapshots, fileDownloads, fileStatuses, chunks };
 }
 
 async function waitOpen(client) {
@@ -254,7 +259,7 @@ async function testDefaultModeAndMultiClientSync() {
     "labels restored after reconnect",
   );
 
-  sendJson(reconnected, { type: "focus_pane", pane_id: splitPane.id });
+  sendJson(reconnected, { type: "focus_pane", pane_id: splitPane.id, replay: false });
   await sleep(100);
   sendJson(reconnected, { type: "tmux_command", command: "kill_pane" });
   state = await waitState(
@@ -335,7 +340,7 @@ async function testMobileFixZoomDoesNotReplayLoop() {
   state = await waitState(client, (next) => panes(next).length === 2, "horizontal split");
   const splitPane = panes(state).find((pane) => pane.id !== firstPane.id);
   assert(splitPane, "expected split pane");
-  sendJson(client, { type: "focus_pane", pane_id: firstPane.id });
+  sendJson(client, { type: "focus_pane", pane_id: firstPane.id, replay: false });
   await sleep(150);
 
   const clearCountBefore = client.clearEvents.length;
@@ -369,6 +374,7 @@ async function testMobileFixZoomDoesNotReplayLoop() {
     client.clearEvents.length === clearCountBefore,
     `resize broadcast ${client.clearEvents.length - clearCountBefore} clear events`,
   );
+  assert(client.paneSnapshots.length === 0, `resize emitted ${client.paneSnapshots.length} pane snapshots`);
   const resizeOutputBytes = client.chunks
     .slice(chunkCountBefore)
     .reduce((total, chunk) => total + chunk.length, 0);
@@ -420,6 +426,54 @@ async function testTerminalFileBridge() {
   await deleteSession(session.id);
 }
 
+async function testPaneOutputContinuesWithoutFocusReplay() {
+  const session = await createSession({
+    name: "it-pane-cache",
+    mode: "local_cc",
+    cols: 100,
+    rows: 28,
+    tmux_name: `wt_it_cache_${Date.now()}`,
+  });
+  const client = connect(session.id, "cache-client");
+  await waitOpen(client);
+  let state = await waitState(client, (next) => panes(next).length === 1, "initial pane");
+  const firstPane = panes(state)[0];
+
+  sendJson(client, { type: "tmux_command", command: "new_window" });
+  state = await waitState(client, (next) => next.windows.length >= 2, "second tab");
+  const secondPane = panes(state).find((pane) => pane.id !== firstPane.id);
+  assert(secondPane, "expected second tab pane");
+
+  const clearCountBeforeFocus = client.clearEvents.length;
+  sendJson(client, { type: "focus_pane", pane_id: firstPane.id, replay: false });
+  await sleep(100);
+  client.ws.send("for i in $(seq 1 80); do echo WT_BG_$i; sleep 0.01; done\n");
+  await sleep(100);
+  sendJson(client, { type: "focus_pane", pane_id: secondPane.id, replay: false });
+  await sleep(150);
+  assert(
+    client.clearEvents.length === clearCountBeforeFocus,
+    `no-replay focus emitted ${client.clearEvents.length - clearCountBeforeFocus} clear events`,
+  );
+  await waitForChunk(client, (chunk) => chunk.includes("WT_BG_80"), "background pane output");
+
+  const chunkCountBeforeReturn = client.chunks.length;
+  const clearCountBeforeReturn = client.clearEvents.length;
+  sendJson(client, { type: "focus_pane", pane_id: firstPane.id, replay: false });
+  await sleep(300);
+  assert(
+    client.clearEvents.length === clearCountBeforeReturn,
+    `return focus emitted ${client.clearEvents.length - clearCountBeforeReturn} clear events`,
+  );
+  assert(
+    client.chunks.length - chunkCountBeforeReturn < 10,
+    `return focus replayed ${client.chunks.length - chunkCountBeforeReturn} chunks`,
+  );
+
+  await closeClient(client);
+  await deleteSession(session.id);
+}
+
 async function cleanup() {
   for (const sessionId of [...createdSessions]) {
     await deleteSession(sessionId);
@@ -449,6 +503,9 @@ async function run() {
 
   await testTerminalFileBridge();
   log("ok terminal file bridge upload/download");
+
+  await testPaneOutputContinuesWithoutFocusReplay();
+  log("ok pane output continues across no-replay tab focus");
 }
 
 run()

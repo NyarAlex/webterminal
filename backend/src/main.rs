@@ -37,7 +37,6 @@ const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 36;
 const REPLAY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const INITIAL_REPLAY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
-const CAPTURE_PANE_HISTORY_LINES: u16 = 5000;
 const FILE_TRANSFER_BASE64_LIMIT: usize = 64 * 1024 * 1024;
 const DIRECT_STREAM_ID: &str = "__direct__";
 const DOWNLOAD_BEGIN_MARKER: &str = "__WEBTERMINAL_DOWNLOAD_BEGIN__:";
@@ -166,6 +165,10 @@ enum SessionEvent {
         pane_id: String,
         data: Vec<u8>,
     },
+    PaneSnapshot {
+        pane_id: String,
+        data: Vec<u8>,
+    },
     TmuxState(TmuxStateSnapshot),
     FileDownload {
         id: String,
@@ -215,6 +218,7 @@ struct TmuxPane {
 enum ClientMessage {
     FocusPane {
         pane_id: String,
+        replay: Option<bool>,
     },
     TmuxCommand {
         command: TmuxUiCommand,
@@ -284,6 +288,14 @@ enum ServerMessage<'a> {
     Clear,
     FocusPane {
         pane_id: &'a str,
+    },
+    PaneOutput {
+        pane_id: &'a str,
+        data_base64: String,
+    },
+    PaneSnapshot {
+        pane_id: &'a str,
+        data_base64: String,
     },
     TmuxState {
         state: TmuxStateSnapshot,
@@ -430,8 +442,12 @@ impl TerminalSession {
                 .pane_replay
                 .entry(pane_id.to_string())
                 .or_insert_with(ReplayBuffer::new);
-            replay.replace(snapshot);
+            replay.replace(snapshot.clone());
         }
+        let _ = self.output_tx.send(SessionEvent::PaneSnapshot {
+            pane_id: pane_id.to_string(),
+            data: snapshot,
+        });
     }
 
     fn replay_tail_chunks(&self) -> Vec<Vec<u8>> {
@@ -506,6 +522,18 @@ impl TerminalSession {
         }
     }
 
+    fn tmux_control_initialized(&self) -> bool {
+        match &self.input_mode {
+            InputMode::TmuxControl(state) => {
+                state
+                    .lock()
+                    .expect("tmux control state lock poisoned")
+                    .initialized
+            }
+            InputMode::Direct => true,
+        }
+    }
+
     fn default_pane_id(&self) -> Option<String> {
         self.tmux_state_snapshot().and_then(|state| {
             state.active_pane.or_else(|| {
@@ -565,33 +593,8 @@ impl TerminalSession {
     }
 
     fn request_tmux_pane_captures(&self, panes: Vec<TmuxPane>) -> Result<()> {
-        if panes.is_empty() {
-            return Ok(());
-        }
-
-        let panes = panes
-            .into_iter()
-            .filter(|pane| should_capture_pane_snapshot(&pane.current_command))
-            .map(|pane| pane.id)
-            .collect::<Vec<_>>();
-        if panes.is_empty() {
-            return Ok(());
-        }
-
-        if let InputMode::TmuxControl(state) = &self.input_mode {
-            let mut state = state.lock().expect("tmux control state lock poisoned");
-            state.pending_capture_queue.extend(panes.iter().cloned());
-        }
-
-        let mut commands = String::new();
-        for pane in panes {
-            commands.push_str(&format!(
-                "capture-pane -e -p -t {} -S -{}\n",
-                tmux_quote(&pane),
-                CAPTURE_PANE_HISTORY_LINES
-            ));
-        }
-        self.write_raw_input(commands.into_bytes())
+        let _ = panes;
+        Ok(())
     }
 
     fn send_tmux_ui_command(&self, command: TmuxUiCommand, pane_id: Option<&str>) -> Result<()> {
@@ -1066,6 +1069,36 @@ fn split_transfer_marker(rest: &str) -> (&str, Option<&str>) {
         })
 }
 
+fn encode_base64(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(data.len().div_ceil(3) * 4);
+    let mut chunks = data.chunks_exact(3);
+    for chunk in &mut chunks {
+        let n = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | chunk[2] as u32;
+        output.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        output.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        output.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
+        output.push(TABLE[(n & 0x3f) as usize] as char);
+    }
+
+    let remainder = chunks.remainder();
+    if remainder.len() == 1 {
+        let n = (remainder[0] as u32) << 16;
+        output.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        output.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        output.push('=');
+        output.push('=');
+    } else if remainder.len() == 2 {
+        let n = ((remainder[0] as u32) << 16) | ((remainder[1] as u32) << 8);
+        output.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        output.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        output.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
+        output.push('=');
+    }
+
+    output
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum SessionMode {
@@ -1525,9 +1558,14 @@ async fn handle_socket(
 
     if let Some(state) = session.tmux_state_snapshot() {
         let has_tmux_panes = state.windows.iter().any(|window| !window.panes.is_empty());
-        if send_server_message(&mut socket, &ServerMessage::TmuxState { state })
-            .await
-            .is_err()
+        if send_server_message(
+            &mut socket,
+            &ServerMessage::TmuxState {
+                state: state.clone(),
+            },
+        )
+        .await
+        .is_err()
         {
             if count_viewer {
                 session.viewers.fetch_sub(1, Ordering::Relaxed);
@@ -1536,9 +1574,10 @@ async fn handle_socket(
         }
         if has_tmux_panes {
             if let Some(pane_id) = focused_pane.as_deref() {
-                if send_focus_and_replay(&mut socket, &session, pane_id)
-                    .await
-                    .is_err()
+                if send_focus(&mut socket, pane_id).await.is_err()
+                    || send_all_pane_replay(&mut socket, &session, &state)
+                        .await
+                        .is_err()
                 {
                     if count_viewer {
                         session.viewers.fetch_sub(1, Ordering::Relaxed);
@@ -1556,7 +1595,10 @@ async fn handle_socket(
                 }
             }
         }
-        if !has_tmux_panes && let Err(err) = session.request_tmux_state_refresh() {
+        if !has_tmux_panes
+            && session.tmux_control_initialized()
+            && let Err(err) = session.request_tmux_state_refresh()
+        {
             warn!(session = %session.id, error = %err, "failed to request tmux state");
         }
     } else {
@@ -1579,9 +1621,14 @@ async fn handle_socket(
                             continue;
                         }
                         match serde_json::from_str::<ClientMessage>(&text) {
-                            Ok(ClientMessage::FocusPane { pane_id }) => {
+                            Ok(ClientMessage::FocusPane { pane_id, replay }) => {
                                 focused_pane = Some(pane_id.clone());
-                                if send_focus_and_replay(&mut socket, &session, &pane_id).await.is_err() {
+                                let result = if replay.unwrap_or(true) {
+                                    send_focus_and_replay(&mut socket, &session, &pane_id).await
+                                } else {
+                                    send_focus(&mut socket, &pane_id).await
+                                };
+                                if result.is_err() {
                                     break;
                                 }
                             }
@@ -1769,10 +1816,14 @@ async fn handle_socket(
                         if socket.send(Message::Binary(chunk.into())).await.is_err() { break; }
                     }
                     Ok(SessionEvent::PaneOutput { pane_id, data }) => {
-                        if focused_pane.as_deref() == Some(pane_id.as_str())
-                            && socket.send(Message::Binary(data.into())).await.is_err() {
+                        if send_pane_output(&mut socket, &pane_id, data).await.is_err() {
                                 break;
-                            }
+                        }
+                    }
+                    Ok(SessionEvent::PaneSnapshot { pane_id, data }) => {
+                        if send_pane_snapshot(&mut socket, &pane_id, data).await.is_err() {
+                            break;
+                        }
                     }
                     Ok(SessionEvent::TmuxState(state)) => {
                         if focused_pane.is_none() {
@@ -1780,7 +1831,7 @@ async fn handle_socket(
                                 state.windows.iter().flat_map(|window| window.panes.iter()).next().map(|pane| pane.id.clone())
                             });
                             if let Some(pane_id) = focused_pane.as_deref()
-                                && send_focus_and_replay(&mut socket, &session, pane_id).await.is_err() {
+                                && send_focus(&mut socket, pane_id).await.is_err() {
                                     break;
                                 }
                         }
@@ -1837,7 +1888,7 @@ async fn send_focus_and_replay(
     session: &TerminalSession,
     pane_id: &str,
 ) -> Result<()> {
-    send_server_message(socket, &ServerMessage::FocusPane { pane_id }).await?;
+    send_focus(socket, pane_id).await?;
     send_server_message(socket, &ServerMessage::Clear).await?;
     for chunk in session.replay_pane_tail_chunks(pane_id) {
         socket
@@ -1846,6 +1897,49 @@ async fn send_focus_and_replay(
             .context("failed to send pane replay")?;
     }
     Ok(())
+}
+
+async fn send_focus(socket: &mut WebSocket, pane_id: &str) -> Result<()> {
+    send_server_message(socket, &ServerMessage::FocusPane { pane_id }).await
+}
+
+async fn send_all_pane_replay(
+    socket: &mut WebSocket,
+    session: &TerminalSession,
+    state: &TmuxStateSnapshot,
+) -> Result<()> {
+    for pane in state.windows.iter().flat_map(|window| window.panes.iter()) {
+        for chunk in session.replay_pane_tail_chunks(&pane.id) {
+            send_pane_output(socket, &pane.id, chunk).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn send_pane_output(socket: &mut WebSocket, pane_id: &str, data: Vec<u8>) -> Result<()> {
+    const MAX_PANE_OUTPUT_CHUNK: usize = 48 * 1024;
+    for chunk in data.chunks(MAX_PANE_OUTPUT_CHUNK) {
+        send_server_message(
+            socket,
+            &ServerMessage::PaneOutput {
+                pane_id,
+                data_base64: encode_base64(chunk),
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn send_pane_snapshot(socket: &mut WebSocket, pane_id: &str, data: Vec<u8>) -> Result<()> {
+    send_server_message(
+        socket,
+        &ServerMessage::PaneSnapshot {
+            pane_id,
+            data_base64: encode_base64(&data),
+        },
+    )
+    .await
 }
 
 async fn send_server_message(socket: &mut WebSocket, message: &ServerMessage<'_>) -> Result<()> {
@@ -2299,13 +2393,7 @@ fn handle_tmux_state_line(
                     .windows
                     .sort_by_key(|window| window.index.unwrap_or(u16::MAX));
                 state.pending_generation = None;
-                let panes_to_capture = state
-                    .windows
-                    .iter()
-                    .flat_map(|window| window.panes.iter())
-                    .cloned()
-                    .collect::<Vec<_>>();
-                (Some(state.snapshot()), panes_to_capture)
+                (Some(state.snapshot()), Vec::new())
             } else {
                 (None, Vec::new())
             }
@@ -2326,26 +2414,6 @@ fn broadcast_tmux_state(session: &TerminalSession) {
     if let Some(state) = session.tmux_state_snapshot() {
         let _ = session.output_tx.send(SessionEvent::TmuxState(state));
     }
-}
-
-fn should_capture_pane_snapshot(command: &str) -> bool {
-    let command = command.rsplit('/').next().unwrap_or(command);
-    !matches!(
-        command,
-        "vi" | "vim"
-            | "nvim"
-            | "view"
-            | "less"
-            | "more"
-            | "man"
-            | "top"
-            | "htop"
-            | "btop"
-            | "nano"
-            | "emacs"
-            | "scp"
-            | "sftp"
-    )
 }
 
 fn is_tmux_structure_event(line: &[u8]) -> bool {

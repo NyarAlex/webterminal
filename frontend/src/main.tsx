@@ -40,6 +40,7 @@ const FILE_UPLOAD_CHUNK_CHARS = 2048;
 const DESKTOP_PANE_EDGE_GUARD_PX = 24;
 const DESKTOP_PANE_SEPARATOR_GAP_PX = 24;
 const TERMINAL_FIT_GUARD_PX = 18;
+const TERMINAL_SCROLLBAR_GUARD_PX = 12;
 
 function focusedPaneStorageKey(sessionId: string): string {
   return `webterminal.focusedPane.${sessionId}`;
@@ -66,8 +67,20 @@ function writeStoredValue(key: string, value: string | null) {
 }
 
 function scrollTerminalToBottomSoon(term: Terminal) {
-  term.scrollToBottom();
-  window.requestAnimationFrame(() => term.scrollToBottom());
+  if (!term.element?.isConnected) return;
+  try {
+    term.scrollToBottom();
+  } catch {
+    return;
+  }
+  window.requestAnimationFrame(() => {
+    if (!term.element?.isConnected) return;
+    try {
+      term.scrollToBottom();
+    } catch {
+      // xterm can briefly lack render dimensions while its element is being moved between panes.
+    }
+  });
 }
 
 function terminalIsNearBottom(term: Terminal): boolean {
@@ -127,6 +140,48 @@ function base64ToBlob(value: string): Blob {
     parts.push(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
   }
   return new Blob(parts, { type: "application/octet-stream" });
+}
+
+function base64ToBytes(value: string): Uint8Array {
+  return Uint8Array.from(window.atob(value), (char) => char.charCodeAt(0));
+}
+
+function createTerminal(cols: number, rows: number, fontSize: number): Terminal {
+  const term = new Terminal({
+    cols,
+    rows,
+    cursorBlink: true,
+    convertEol: false,
+    fontFamily:
+      "SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, Liberation Mono, monospace",
+    fontSize,
+    lineHeight: 1.15,
+    scrollback: 50000,
+    theme: {
+      background: "#101315",
+      foreground: "#d7e0e5",
+      cursor: "#f3c969",
+      selectionBackground: "#31515f",
+      black: "#0f1316",
+      red: "#d96c68",
+      green: "#89b482",
+      yellow: "#d9b56c",
+      blue: "#6c96d9",
+      magenta: "#b482c7",
+      cyan: "#6cb7b8",
+      white: "#d7e0e5",
+      brightBlack: "#5d6a70",
+      brightRed: "#f0837d",
+      brightGreen: "#9ccc91",
+      brightYellow: "#edc879",
+      brightBlue: "#81a9ef",
+      brightMagenta: "#c798da",
+      brightCyan: "#80d0d0",
+      brightWhite: "#f1f5f7",
+    },
+  });
+  term.loadAddon(new WebLinksAddon());
+  return term;
 }
 
 function triggerBrowserDownload(filename: string, dataBase64: string) {
@@ -245,6 +300,8 @@ interface TmuxPane {
 type ServerMessage =
   | { type: "clear" }
   | { type: "focus_pane"; pane_id: string }
+  | { type: "pane_output"; pane_id: string; data_base64: string }
+  | { type: "pane_snapshot"; pane_id: string; data_base64: string }
   | { type: "tmux_state"; state: TmuxState }
   | {
       type: "file_download";
@@ -258,6 +315,14 @@ type ServerMessage =
       status: "ok" | "error" | string;
       message: string;
     };
+
+interface CachedPaneTerminal {
+  term: Terminal;
+  element: HTMLDivElement;
+  opened: boolean;
+  dataSub: { dispose: () => void };
+  detachPasteHandler: () => void;
+}
 
 const api = {
   async listSessions(): Promise<SessionSummary[]> {
@@ -708,6 +773,9 @@ function TerminalPane({
   const containerRef = React.useRef<HTMLDivElement | null>(null);
   const desktopGridRef = React.useRef<HTMLDivElement | null>(null);
   const termRef = React.useRef<Terminal | null>(null);
+  const paneTermsRef = React.useRef(new Map<string, CachedPaneTerminal>());
+  const pendingPaneDataRef = React.useRef(new Map<string, Uint8Array[]>());
+  const pendingPaneSnapshotRef = React.useRef(new Map<string, Uint8Array>());
   const wsRef = React.useRef<WebSocket | null>(null);
   const inputEnabledRef = React.useRef(true);
   const lastModeRef = React.useRef<InteractionMode>("input");
@@ -737,6 +805,107 @@ function TerminalPane({
       ? `${windowLabel(activeWindow)} / ${paneLabel(activePane)}`
       : session.name;
 
+  const getCurrentTerm = useCallback(() => {
+    if (controlMode) {
+      const paneId = focusedPaneRef.current;
+      return paneId ? (paneTermsRef.current.get(paneId)?.term ?? termRef.current) : termRef.current;
+    }
+    return termRef.current;
+  }, [controlMode]);
+
+  const ensurePaneTerminal = useCallback(
+    (paneId: string): CachedPaneTerminal => {
+      const cached = paneTermsRef.current.get(paneId);
+      if (cached) return cached;
+
+      const term = createTerminal(session.cols, session.rows, window.innerWidth < 720 ? 12 : 14);
+      const element = document.createElement("div");
+      element.className = "cachedPaneTerminal";
+      attachTerminalKeyHandlers(term, (data) => {
+        const ws = wsRef.current;
+        if (inputEnabledRef.current && ws?.readyState === WebSocket.OPEN) {
+          ws.send(encoderRef.current.encode(data));
+        }
+      });
+      const dataSub = term.onData((data) => {
+        const ws = wsRef.current;
+        if (inputEnabledRef.current && ws?.readyState === WebSocket.OPEN) {
+          ws.send(encoderRef.current.encode(data));
+        }
+      });
+      const detachPasteHandler = attachPasteHandler(element, (data) => {
+        const ws = wsRef.current;
+        if (inputEnabledRef.current && ws?.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "paste", data, pane_id: paneId }));
+        }
+      });
+      const entry = { term, element, opened: false, dataSub, detachPasteHandler };
+      paneTermsRef.current.set(paneId, entry);
+      return entry;
+    },
+    [session.cols, session.rows],
+  );
+
+  const mountPaneTerminal = useCallback(
+    (paneId: string, host: HTMLElement | null) => {
+      if (!host) return null;
+      const entry = ensurePaneTerminal(paneId);
+      if (entry.element.parentElement !== host) {
+        host.replaceChildren(entry.element);
+      }
+      if (!entry.opened) {
+        entry.term.open(entry.element);
+        entry.opened = true;
+        const pending = pendingPaneSnapshotRef.current.has(paneId)
+          ? null
+          : pendingPaneDataRef.current.get(paneId);
+        if (pending) {
+          for (const chunk of pending) {
+            writeTerminalData(entry.term, chunk, false);
+          }
+          pendingPaneDataRef.current.delete(paneId);
+        }
+      }
+      termRef.current = entry.term;
+      return entry.term;
+    },
+    [ensurePaneTerminal],
+  );
+
+  const flushPaneSnapshot = useCallback((paneId: string) => {
+    pendingPaneSnapshotRef.current.delete(paneId);
+    return true;
+  }, []);
+
+  const writePaneOutput = useCallback(
+    (paneId: string, data: Uint8Array) => {
+      if (pendingPaneSnapshotRef.current.has(paneId)) {
+        const pending = pendingPaneDataRef.current.get(paneId) ?? [];
+        pending.push(data);
+        pendingPaneDataRef.current.set(paneId, pending);
+        return;
+      }
+      const entry = paneTermsRef.current.get(paneId);
+      if (!entry?.opened) {
+        const pending = pendingPaneDataRef.current.get(paneId) ?? [];
+        pending.push(data);
+        pendingPaneDataRef.current.set(paneId, pending);
+        return;
+      }
+      const shouldFollow = inputEnabledRef.current && focusedPaneRef.current === paneId;
+      writeTerminalData(entry.term, data, shouldFollow);
+    },
+    [],
+  );
+
+  const replacePaneSnapshot = useCallback(
+    (paneId: string, data: Uint8Array) => {
+      void paneId;
+      void data;
+    },
+    [],
+  );
+
   const rememberFocusedPane = useCallback(
     (paneId: string | null) => {
       setFocusedPaneState(paneId);
@@ -748,7 +917,7 @@ function TerminalPane({
 
   const resizeTerminalToContainer = useCallback(
     () => {
-      const term = termRef.current;
+      const term = getCurrentTerm();
       const container = containerRef.current;
       if (!term || !container) return;
 
@@ -787,7 +956,7 @@ function TerminalPane({
             zoomReplayTimerRef.current = null;
             const ws = wsRef.current;
             if (ws?.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ type: "focus_pane", pane_id: zoomPaneId }));
+              ws.send(JSON.stringify({ type: "focus_pane", pane_id: zoomPaneId, replay: false }));
             }
           }, 900);
         })
@@ -799,6 +968,7 @@ function TerminalPane({
       activePane,
       controlMode,
       desktopSplitEnabled,
+      getCurrentTerm,
       session.id,
       onResized,
       onError,
@@ -812,7 +982,7 @@ function TerminalPane({
       window.clearTimeout(viewportRefreshTimerRef.current);
     }
     viewportRefreshTimerRef.current = window.setTimeout(() => {
-      const term = termRef.current;
+      const term = getCurrentTerm();
       viewportRefreshTimerRef.current = null;
       if (!term) return;
       term.resize(term.cols, term.rows);
@@ -820,7 +990,7 @@ function TerminalPane({
         scrollTerminalToBottomSoon(term);
       }
     }, delay);
-  }, []);
+  }, [getCurrentTerm]);
 
   useEffect(() => {
     return () => {
@@ -844,44 +1014,36 @@ function TerminalPane({
   }, [focusedPane]);
 
   useEffect(() => {
+    const paneExists =
+      tmuxState?.windows.some((window) => window.panes.some((pane) => pane.id === focusedPane)) ?? false;
+    if (!controlMode || !focusedPane || !paneExists || desktopSplitEnabled) return;
+    const term = mountPaneTerminal(focusedPane, containerRef.current);
+    if (!term) return;
+    term.options.disableStdin = interactionMode === "browse";
+    term.resize(session.cols, session.rows);
+    flushPaneSnapshot(focusedPane);
+    if (interactionMode === "input") {
+      scrollTerminalToBottomSoon(term);
+      term.focus();
+    }
+  }, [
+    controlMode,
+    desktopSplitEnabled,
+    focusedPane,
+    interactionMode,
+    flushPaneSnapshot,
+    mountPaneTerminal,
+    session.cols,
+    session.rows,
+    tmuxState,
+  ]);
+
+  useEffect(() => {
     setToolsOpen(false);
   }, [session.id]);
 
   useEffect(() => {
-    const term = new Terminal({
-      cols: session.cols,
-      rows: session.rows,
-      cursorBlink: true,
-      convertEol: false,
-      fontFamily:
-        "SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, Liberation Mono, monospace",
-      fontSize: window.innerWidth < 720 ? 12 : 14,
-      lineHeight: 1.15,
-      scrollback: 50000,
-      theme: {
-        background: "#101315",
-        foreground: "#d7e0e5",
-        cursor: "#f3c969",
-        selectionBackground: "#31515f",
-        black: "#0f1316",
-        red: "#d96c68",
-        green: "#89b482",
-        yellow: "#d9b56c",
-        blue: "#6c96d9",
-        magenta: "#b482c7",
-        cyan: "#6cb7b8",
-        white: "#d7e0e5",
-        brightBlack: "#5d6a70",
-        brightRed: "#f0837d",
-        brightGreen: "#9ccc91",
-        brightYellow: "#edc879",
-        brightBlue: "#81a9ef",
-        brightMagenta: "#c798da",
-        brightCyan: "#80d0d0",
-        brightWhite: "#f1f5f7",
-      },
-    });
-    term.loadAddon(new WebLinksAddon());
+    const term = createTerminal(session.cols, session.rows, window.innerWidth < 720 ? 12 : 14);
     attachTerminalKeyHandlers(term, (data) => {
       const ws = wsRef.current;
       if (inputEnabledRef.current && ws?.readyState === WebSocket.OPEN) {
@@ -891,6 +1053,7 @@ function TerminalPane({
     termRef.current = term;
 
     if (!containerRef.current) return;
+    containerRef.current.replaceChildren();
     term.open(containerRef.current);
     const detachPasteHandler = attachPasteHandler(containerRef.current, (data) => {
       const ws = wsRef.current;
@@ -947,7 +1110,7 @@ function TerminalPane({
         }
         const paneId = focusedPaneRef.current;
         if (paneId) {
-          ws.send(JSON.stringify({ type: "focus_pane", pane_id: paneId }));
+          ws.send(JSON.stringify({ type: "focus_pane", pane_id: paneId, replay: false }));
         }
       };
       ws.onclose = () => {
@@ -976,6 +1139,8 @@ function TerminalPane({
             term,
             setTmuxState,
             rememberFocusedPane,
+            writePaneOutput,
+            replacePaneSnapshot,
             (message) => {
               if (!transferIdsRef.current.has(message.id)) return;
               transferIdsRef.current.delete(message.id);
@@ -1047,14 +1212,34 @@ function TerminalPane({
       detachPasteHandler();
       wsRef.current?.close();
       term.dispose();
+      for (const entry of paneTermsRef.current.values()) {
+        entry.dataSub.dispose();
+        entry.detachPasteHandler();
+        entry.term.dispose();
+      }
+      paneTermsRef.current.clear();
+      pendingPaneDataRef.current.clear();
+      pendingPaneSnapshotRef.current.clear();
       termRef.current = null;
       wsRef.current = null;
     };
-  }, [session.id, scheduleLocalViewportRefresh, rememberFocusedPane]);
+  }, [
+    session.id,
+    scheduleLocalViewportRefresh,
+    rememberFocusedPane,
+    writePaneOutput,
+    replacePaneSnapshot,
+  ]);
 
   useEffect(() => {
     if (!tmuxState) return;
     const panes = tmuxState.windows.flatMap((window) => window.panes);
+    if (panes.length === 0) {
+      if (focusedPane) {
+        rememberFocusedPane(null);
+      }
+      return;
+    }
     if (focusedPane && panes.some((pane) => pane.id === focusedPane)) return;
 
     const storedPane = readStoredValue(focusedPaneStorageKey(session.id));
@@ -1070,7 +1255,7 @@ function TerminalPane({
 
   useEffect(() => {
     inputEnabledRef.current = interactionMode === "input";
-    const term = termRef.current;
+    const term = getCurrentTerm();
     const ws = wsRef.current;
     if (!term) return;
 
@@ -1088,12 +1273,11 @@ function TerminalPane({
       term.blur();
     }
     lastModeRef.current = interactionMode;
-  }, [controlMode, interactionMode]);
+  }, [controlMode, getCurrentTerm, interactionMode]);
 
   useEffect(() => {
     const container = containerRef.current;
-    const term = termRef.current;
-    if (!container || !term) return;
+    if (!container) return;
 
     let lastTouchY: number | null = null;
     let scrollRemainder = 0;
@@ -1115,6 +1299,8 @@ function TerminalPane({
     };
 
     const scrollHistory = (deltaY: number) => {
+      const term = getCurrentTerm();
+      if (!term) return;
       scrollRemainder += deltaY;
       const lines = Math.trunc(scrollRemainder / lineThreshold);
       if (lines !== 0) {
@@ -1158,7 +1344,7 @@ function TerminalPane({
       container.removeEventListener("touchend", onTouchEnd, { capture: true });
       container.removeEventListener("touchcancel", onTouchEnd, { capture: true });
     };
-  }, [controlMode, interactionMode]);
+  }, [controlMode, getCurrentTerm, interactionMode]);
 
   useEffect(() => {
     const refreshTerminalViewport = () => scheduleLocalViewportRefresh();
@@ -1207,7 +1393,7 @@ function TerminalPane({
 
     setInteractionMode("input");
     rememberFocusedPane(paneId);
-    termRef.current?.clear();
+    mountPaneTerminal(paneId, desktopSplitEnabled ? null : containerRef.current);
     if (shouldZoomBeforeFocus) {
       ws.send(JSON.stringify({ type: "tmux_command", command: "zoom_pane", pane_id: paneId }));
       if (zoomReplayTimerRef.current !== null) {
@@ -1217,12 +1403,12 @@ function TerminalPane({
         zoomReplayTimerRef.current = null;
         const currentWs = wsRef.current;
         if (currentWs?.readyState === WebSocket.OPEN) {
-          currentWs.send(JSON.stringify({ type: "focus_pane", pane_id: paneId }));
+          currentWs.send(JSON.stringify({ type: "focus_pane", pane_id: paneId, replay: false }));
         }
       }, 900);
       return;
     }
-    ws.send(JSON.stringify({ type: "focus_pane", pane_id: paneId }));
+    ws.send(JSON.stringify({ type: "focus_pane", pane_id: paneId, replay: false }));
   };
 
   const sendTmuxCommand = (command: TmuxCommand) => {
@@ -1263,7 +1449,7 @@ function TerminalPane({
   };
 
   const copySelection = async () => {
-    const selection = termRef.current?.getSelection() ?? "";
+    const selection = getCurrentTerm()?.getSelection() ?? "";
     if (!selection) return;
     await navigator.clipboard.writeText(selection);
   };
@@ -1387,10 +1573,11 @@ function TerminalPane({
       {desktopSplitEnabled && visibleWindow && (
         <DesktopPaneGrid
           ref={desktopGridRef}
-          sessionId={session.id}
           window={visibleWindow}
           focusedPane={focusedPane}
           interactionMode={interactionMode}
+          flushPaneSnapshot={flushPaneSnapshot}
+          mountPaneTerminal={mountPaneTerminal}
           onFocusPane={focusPane}
           onResizePane={resizePane}
         />
@@ -1406,13 +1593,16 @@ function TerminalPane({
 
 function measureTerminalGrid(container: HTMLElement, term: Terminal): ResizeSessionPayload {
   const styles = window.getComputedStyle(container);
+  const paddingX = parseFloat(styles.paddingLeft) + parseFloat(styles.paddingRight);
+  const paddingY = parseFloat(styles.paddingTop) + parseFloat(styles.paddingBottom);
+  const verticalScrollbarWidth = Math.max(container.offsetWidth - container.clientWidth, 0);
   const width =
     container.clientWidth -
-    parseFloat(styles.paddingLeft) -
-    parseFloat(styles.paddingRight) -
+    paddingX -
+    verticalScrollbarWidth -
+    TERMINAL_SCROLLBAR_GUARD_PX -
     TERMINAL_FIT_GUARD_PX;
-  const height =
-    container.clientHeight - parseFloat(styles.paddingTop) - parseFloat(styles.paddingBottom);
+  const height = container.clientHeight - paddingY;
   const screen = container.querySelector<HTMLElement>(".xterm-screen");
   const rect = screen?.getBoundingClientRect();
   const cellWidth =
@@ -1482,6 +1672,8 @@ function handleServerTextMessage(
   term: Terminal,
   setTmuxState: React.Dispatch<React.SetStateAction<TmuxState | null>>,
   setFocusedPane: (paneId: string) => void,
+  onPaneOutput: (paneId: string, data: Uint8Array) => void,
+  onPaneSnapshot: (paneId: string, data: Uint8Array) => void,
   onFileDownload: (message: Extract<ServerMessage, { type: "file_download" }>) => void,
   onFileTransferStatus: (message: Extract<ServerMessage, { type: "file_transfer_status" }>) => void,
 ): boolean {
@@ -1498,6 +1690,12 @@ function handleServerTextMessage(
     return true;
   } else if (message.type === "focus_pane") {
     setFocusedPane(message.pane_id);
+  } else if (message.type === "pane_output") {
+    onPaneOutput(message.pane_id, base64ToBytes(message.data_base64));
+    return false;
+  } else if (message.type === "pane_snapshot") {
+    onPaneSnapshot(message.pane_id, base64ToBytes(message.data_base64));
+    return false;
   } else if (message.type === "tmux_state") {
     setTmuxState(message.state);
   } else if (message.type === "file_download") {
@@ -1532,17 +1730,19 @@ function paneLabel(pane: TmuxPane): string {
 }
 
 const DesktopPaneGrid = React.forwardRef<HTMLDivElement, {
-  sessionId: string;
   window: TmuxWindow;
   focusedPane: string | null;
   interactionMode: InteractionMode;
+  flushPaneSnapshot: (paneId: string) => boolean;
+  mountPaneTerminal: (paneId: string, host: HTMLElement | null) => Terminal | null;
   onFocusPane: (paneId: string) => void;
   onResizePane: (paneId: string, direction: ResizeDirection, amount: number) => void;
 }>(function DesktopPaneGrid({
-  sessionId,
   window,
   focusedPane,
   interactionMode,
+  flushPaneSnapshot,
+  mountPaneTerminal,
   onFocusPane,
   onResizePane,
 }, ref) {
@@ -1665,11 +1865,12 @@ const DesktopPaneGrid = React.forwardRef<HTMLDivElement, {
         return (
           <PaneTerminal
             key={pane.id}
-            sessionId={sessionId}
             pane={pane}
             selected={pane.id === focusedPane}
             interactionMode={interactionMode}
             style={style}
+            flushPaneSnapshot={flushPaneSnapshot}
+            mountPaneTerminal={mountPaneTerminal}
             onFocus={() => onFocusPane(pane.id)}
             onResizePane={onResizePane}
             onCellSize={rememberCellSize}
@@ -1681,31 +1882,28 @@ const DesktopPaneGrid = React.forwardRef<HTMLDivElement, {
 });
 
 function PaneTerminal({
-  sessionId,
   pane,
   selected,
   interactionMode,
   style,
+  flushPaneSnapshot,
+  mountPaneTerminal,
   onFocus,
   onResizePane,
   onCellSize,
 }: {
-  sessionId: string;
   pane: TmuxPane;
   selected: boolean;
   interactionMode: InteractionMode;
   style: React.CSSProperties;
+  flushPaneSnapshot: (paneId: string) => boolean;
+  mountPaneTerminal: (paneId: string, host: HTMLElement | null) => Terminal | null;
   onFocus: () => void;
   onResizePane: (paneId: string, direction: ResizeDirection, amount: number) => void;
   onCellSize: (width: number, height: number) => void;
 }) {
   const containerRef = React.useRef<HTMLDivElement | null>(null);
   const termRef = React.useRef<Terminal | null>(null);
-  const wsRef = React.useRef<WebSocket | null>(null);
-  const reconnectTimerRef = React.useRef<number | null>(null);
-  const encoderRef = React.useRef(new TextEncoder());
-  const interactionModeRef = React.useRef(interactionMode);
-  const selectedRef = React.useRef(selected);
   const dragRef = React.useRef<{
     x: number;
     y: number;
@@ -1714,51 +1912,9 @@ function PaneTerminal({
   } | null>(null);
 
   useEffect(() => {
-    interactionModeRef.current = interactionMode;
-  }, [interactionMode]);
-
-  useEffect(() => {
-    selectedRef.current = selected;
-  }, [selected]);
-
-  useEffect(() => {
-    const term = new Terminal({
-      cols: pane.width ?? 80,
-      rows: pane.height ?? 24,
-      cursorBlink: true,
-      convertEol: false,
-      fontFamily:
-        "SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, Liberation Mono, monospace",
-      fontSize: 13,
-      lineHeight: 1.15,
-      scrollback: 50000,
-      theme: {
-        background: "#101315",
-        foreground: "#d7e0e5",
-        cursor: "#f3c969",
-        selectionBackground: "#31515f",
-      },
-    });
-    term.loadAddon(new WebLinksAddon());
-    attachTerminalKeyHandlers(term, (data) => {
-      const ws = wsRef.current;
-      if (interactionModeRef.current === "input" && ws?.readyState === WebSocket.OPEN) {
-        ws.send(encoderRef.current.encode(data));
-      }
-    });
+    const term = mountPaneTerminal(pane.id, containerRef.current);
     termRef.current = term;
-
-    if (!containerRef.current) return;
-    term.open(containerRef.current);
-    const detachPasteHandler = attachPasteHandler(containerRef.current, (data) => {
-      const ws = wsRef.current;
-      if (interactionModeRef.current === "input" && ws?.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "paste", data, pane_id: pane.id }));
-      }
-    });
-
-    let disposed = false;
-    let reconnectAttempt = 0;
+    if (!term) return;
 
     const resizeToPane = () => {
       const container = containerRef.current;
@@ -1766,6 +1922,7 @@ function PaneTerminal({
       const cols = clamp(pane.width ?? 80, 1, 240);
       const rows = clamp(pane.height ?? 24, 1, 80);
       term.resize(cols, rows);
+      flushPaneSnapshot(pane.id);
       container.dataset.cols = String(cols);
       container.dataset.rows = String(rows);
       container.dataset.paneLeft = String(pane.left ?? 0);
@@ -1781,110 +1938,16 @@ function PaneTerminal({
 
     window.setTimeout(resizeToPane, 0);
     window.setTimeout(resizeToPane, 120);
-
-    const clearReconnectTimer = () => {
-      if (reconnectTimerRef.current !== null) {
-        window.clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = null;
-      }
-    };
-
-    const connect = () => {
-      if (disposed) return;
-      const current = wsRef.current;
-      if (
-        current &&
-        (current.readyState === WebSocket.OPEN || current.readyState === WebSocket.CONNECTING)
-      ) {
-        return;
-      }
-
-      const proto = window.location.protocol === "https:" ? "wss" : "ws";
-      const ws = new WebSocket(
-        `${proto}://${window.location.host}/ws/sessions/${sessionId}?pane_view=true`,
-      );
-      ws.binaryType = "arraybuffer";
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        if (disposed || wsRef.current !== ws) return;
-        reconnectAttempt = 0;
-        term.clear();
-        ws.send(JSON.stringify({ type: "focus_pane", pane_id: pane.id }));
-        if (interactionModeRef.current === "input" && selectedRef.current) {
-          scrollTerminalToBottomSoon(term);
-        }
-      };
-      ws.onclose = () => {
-        if (wsRef.current === ws) wsRef.current = null;
-        if (disposed || document.hidden) return;
-        clearReconnectTimer();
-        const delay = Math.min(1000 * 2 ** reconnectAttempt, 10000);
-        reconnectAttempt += 1;
-        reconnectTimerRef.current = window.setTimeout(connect, delay);
-      };
-      ws.onmessage = (event) => {
-        if (disposed || wsRef.current !== ws) return;
-        const shouldFollow = interactionModeRef.current === "input" && selectedRef.current;
-        if (event.data instanceof ArrayBuffer) {
-          writeTerminalData(term, new Uint8Array(event.data), shouldFollow);
-        } else if (event.data instanceof Blob) {
-          void event.data.arrayBuffer().then((buffer) => {
-            if (!disposed && wsRef.current === ws) {
-              writeTerminalData(term, new Uint8Array(buffer), shouldFollow);
-            }
-          });
-        } else {
-          const terminalChanged = handlePaneTerminalTextMessage(String(event.data), term);
-          if (terminalChanged && shouldFollow && terminalIsNearBottom(term)) {
-            scrollTerminalToBottomSoon(term);
-          }
-        }
-      };
-    };
-
-    const restoreInputViewport = () => {
-      if (document.hidden) return;
-      if (interactionModeRef.current === "input" && selectedRef.current) {
-        scrollTerminalToBottomSoon(term);
-      }
-    };
-
-    const reconnectWhenVisible = () => {
-      restoreInputViewport();
-      if (!wsRef.current || wsRef.current.readyState >= WebSocket.CLOSING) {
-        reconnectAttempt = 0;
-        clearReconnectTimer();
-        connect();
-      }
-    };
-
-    connect();
-    document.addEventListener("visibilitychange", reconnectWhenVisible);
-    window.addEventListener("focus", restoreInputViewport);
-    window.addEventListener("online", reconnectWhenVisible);
-
-    const dataSub = term.onData((data) => {
-      const ws = wsRef.current;
-      if (interactionModeRef.current === "input" && ws?.readyState === WebSocket.OPEN) {
-        ws.send(encoderRef.current.encode(data));
-      }
-    });
-
-    return () => {
-      disposed = true;
-      document.removeEventListener("visibilitychange", reconnectWhenVisible);
-      window.removeEventListener("focus", restoreInputViewport);
-      window.removeEventListener("online", reconnectWhenVisible);
-      clearReconnectTimer();
-      dataSub.dispose();
-      detachPasteHandler();
-      wsRef.current?.close();
-      term.dispose();
-      termRef.current = null;
-      wsRef.current = null;
-    };
-  }, [onCellSize, pane.height, pane.id, pane.left, pane.top, pane.width, sessionId]);
+  }, [
+    flushPaneSnapshot,
+    mountPaneTerminal,
+    onCellSize,
+    pane.height,
+    pane.id,
+    pane.left,
+    pane.top,
+    pane.width,
+  ]);
 
   useEffect(() => {
     const term = termRef.current;
